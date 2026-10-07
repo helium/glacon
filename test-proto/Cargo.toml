@@ -1,0 +1,12 @@
+[package]
+name = "glacon-test-proto"
+version = "0.1.0"
+edition = "2024"
+description = "Protobuf messages used only by glacon's tests"
+publish = false
+
+[dependencies]
+prost = "0.14"
+
+[build-dependencies]
+prost-build = "0.14"

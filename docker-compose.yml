@@ -1,0 +1,170 @@
+# Services for glacon's integration tests: RustFS (S3), Polaris (Iceberg REST
+# catalog, backed by Postgres) and Trino (used by the tests to read tables).
+# Adapted from helium/oracles; every config file is inlined below.
+#
+#   docker compose up -d --wait
+#   cargo test
+
+services:
+  postgres:
+    image: postgres:14.17
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: postgres
+      POSTGRES_DB: POLARIS
+    ports:
+      - 5432:5432
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres -d postgres"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  rustfs:
+    image: rustfs/rustfs:1.0.0-alpha.90
+    restart: unless-stopped
+    ports:
+      - 9000:9000
+      # file_store's AwsLocal (test buckets) defaults to port 4566.
+      - 4566:9000
+      - 9001:9001
+    environment:
+      RUSTFS_CONSOLE_ENABLE: "true"
+      RUSTFS_ACCESS_KEY: admin
+      RUSTFS_SECRET_KEY: admin
+    healthcheck:
+      test:
+        [
+          "CMD",
+          "sh",
+          "-c",
+          "curl -f http://127.0.0.1:9000/health && curl -f http://127.0.0.1:9001/rustfs/console/health",
+        ]
+      interval: 5s
+      timeout: 10s
+      retries: 10
+
+  rustfs-init:
+    image: amazon/aws-cli:2.34.18
+    depends_on:
+      rustfs:
+        condition: service_healthy
+    restart: "no"
+    environment:
+      AWS_ACCESS_KEY_ID: admin
+      AWS_SECRET_ACCESS_KEY: admin
+      AWS_DEFAULT_REGION: us-east-1
+    configs:
+      - source: rustfs_init
+        target: /init.sh
+    entrypoint: ["sh", "/init.sh"]
+
+  polaris-db-bootstrap:
+    image: apache/polaris-admin-tool:1.3.0-incubating
+    depends_on:
+      postgres:
+        condition: service_healthy
+    environment:
+      POLARIS_PERSISTENCE_TYPE: relational-jdbc
+      QUARKUS_DATASOURCE_JDBC_URL: jdbc:postgresql://postgres:5432/POLARIS
+      QUARKUS_DATASOURCE_USERNAME: postgres
+      QUARKUS_DATASOURCE_PASSWORD: postgres
+    entrypoint: "/bin/sh"
+    command:
+      - "-c"
+      - >-
+        java -jar /deployments/polaris-admin-tool.jar bootstrap --realm=POLARIS --credential=POLARIS,root,s3cr3t ||
+        true
+
+  polaris:
+    image: apache/polaris:1.7.0
+    ports:
+      - 8181:8181
+    depends_on:
+      rustfs:
+        condition: service_healthy
+      rustfs-init:
+        condition: service_completed_successfully
+      polaris-db-bootstrap:
+        condition: service_completed_successfully
+    environment:
+      AWS_REGION: us-west-2
+      AWS_ACCESS_KEY_ID: admin
+      AWS_SECRET_ACCESS_KEY: admin
+      POLARIS_PERSISTENCE_TYPE: relational-jdbc
+      POLARIS_PERSISTENCE_RELATIONAL_JDBC_MAX_RETRIES: 5
+      POLARIS_PERSISTENCE_RELATIONAL_JDBC_INITIAL_DELAY_IN_MS: 100
+      POLARIS_PERSISTENCE_RELATIONAL_JDBC_MAX_DURATION_IN_MS: 5000
+      QUARKUS_DATASOURCE_JDBC_URL: jdbc:postgresql://postgres:5432/POLARIS
+      QUARKUS_DATASOURCE_USERNAME: postgres
+      QUARKUS_DATASOURCE_PASSWORD: postgres
+      POLARIS_BOOTSTRAP_CREDENTIALS: POLARIS,root,s3cr3t
+      POLARIS_REALM_CONTEXT_REALMS: POLARIS
+      QUARKUS_OTEL_SDK_DISABLED: "true"
+      polaris.features."ALLOW_INSECURE_STORAGE_TYPES": "true"
+      polaris.features."SUPPORTED_CATALOG_STORAGE_TYPES": '["S3"]'
+      polaris.readiness.ignore-severe-issues: "true"
+      polaris.features."DROP_WITH_PURGE_ENABLED": "true"
+    healthcheck:
+      test: ["CMD", "curl", "--fail", "http://localhost:8182/q/health"]
+      interval: 2s
+      timeout: 10s
+      retries: 30
+      start_period: 10s
+
+  trino:
+    image: trinodb/trino:483
+    depends_on:
+      polaris:
+        condition: service_healthy
+    restart: unless-stopped
+    ports:
+      - 8080:8080
+    environment:
+      AWS_ACCESS_KEY_ID: admin
+      AWS_SECRET_ACCESS_KEY: admin
+    configs:
+      - source: trino_config
+        target: /etc/trino/config.properties
+      - source: trino_jvm
+        target: /etc/trino/jvm.config
+    healthcheck:
+      test: ["CMD-SHELL", "trino --execute 'SELECT 1' || exit 1"]
+      interval: 5s
+      timeout: 10s
+      retries: 30
+      start_period: 30s
+
+configs:
+  # Bucket every test catalog stores its tables in (see helium-iceberg's
+  # IcebergTestHarness). Test input buckets are created by the tests.
+  rustfs_init:
+    content: |
+      set -e
+      aws --endpoint-url http://rustfs:9000 s3 mb s3://iceberg-test 2>/dev/null \
+        || echo "bucket iceberg-test already exists"
+
+  # Catalogs are created at runtime by the tests (CREATE CATALOG).
+  trino_config:
+    content: |
+      node.environment=iceberg
+      coordinator=true
+      node-scheduler.include-coordinator=true
+      http-server.http.port=8080
+      query.max-memory=8GB
+      query.max-memory-per-node=2GB
+      discovery.uri=http://localhost:8080
+      catalog.management=dynamic
+      catalog.store=memory
+
+  trino_jvm:
+    content: |
+      -server
+      -Xmx4G
+      -XX:+UseG1GC
+      -XX:+UseGCOverheadLimit
+      -XX:+ExplicitGCInvokesConcurrent
+      -XX:+HeapDumpOnOutOfMemoryError
+      -XX:HeapDumpPath=/var/trino/data
+      -XX:+ExitOnOutOfMemoryError

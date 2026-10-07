@@ -1,0 +1,7 @@
+# Integration tests share one Polaris and one Trino; limit how many run at once.
+[test-groups]
+integration = { max-threads = 4 }
+
+[[profile.default.overrides]]
+filter = "binary(integration)"
+test-group = "integration"
