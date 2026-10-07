@@ -127,6 +127,10 @@ rows twice.
   then committed in batches (`max_batch_rows` / `batch_timeout`).
 - If any route fails, the whole process stops.
 
+[docs/runtime.md](docs/runtime.md) shows how a route is split into Tokio
+tasks, where your trait implementations run, and every step a record goes
+through from setup to shutdown.
+
 ## State
 
 `<state_dir>/state.db` (SQLite) is the route's only source of truth; nothing
