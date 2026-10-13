@@ -1,158 +1,226 @@
 # glacon
 
-A library to route protobuf files from S3 buckets into Iceberg tables.
+Route records from inputs, through a middleware, to outputs: protobuf files
+from S3 buckets into Iceberg tables, for example.
 
-A **route** reads one record type from **N inputs** (buckets), lets one
-**middleware** pick which of its **M outputs** (tables) get each record, and
-keeps its progress in its own SQLite database. `Glacon` runs every route as a
-task on oracles' `task_manager`.
+A **route** reads one record type from **N inputs**, runs every batch through
+a **middleware** that picks which of its **M outputs** get each record, and
+writes them. A route is an oracles `task_manager::ManagedTask`: run it in your
+app's `TaskManager`, next to your other routes and tasks.
 
-```text
-input "us" ─┐                          ┌─► output "lake"    (rows A)
-            ├─► record ─► middleware ──┤
-input "eu" ─┘                          └─► output "archive" (rows B)
+## Architecture
+
+```mermaid
+flowchart TB
+    subgraph glacon
+        subgraph glacon-core
+            subgraph Route Task
+                subgraph IT1 [Input Task]
+                    I1[Input 1]
+                end
+                subgraph IT2 [Input Task]
+                    I2[Input 2]
+                end
+                subgraph PT1 [Processor Task]
+                subgraph P1 [Processor 1]
+                        M1[Middleware]
+                    end
+                end
+                subgraph PT2 [Processor Task]
+                    subgraph P2 [Processor 2]
+                        M2[Middleware]
+                    end
+                end
+                subgraph OT1 [Output Task]
+                    O1[Output 1]
+                end
+                subgraph OT2 [Output Task]
+                    O2[Output 2]
+                end
+            end
+        end
+        subgraph glacon-helium
+            FS1[File Store Input]
+            IO1[Iceberg Output]
+        end
+    end
+    subgraph Example Library User
+        EUI1[File Store Speed Test Input]
+        VM1[Verify Speed Test Middleware]
+        VTO1[Verified Table Output]
+        DTO1[Dropped Table Output]
+    end
+
+    I1 -- Channel --> P1
+    I2 -- Channel --> P2
+    P1 -- Channel --> O1
+    P1 -- Channel --> O2
+    P2 -- Channel --> O1
+    P2 -- Channel --> O2
+
+    I1 <--> FS1
+    I2 <--> FS1
+    O1 <--> IO1
+    O2 <--> IO1
+
+    EUI1 <--> FS1
+    VM1 <--> M1
+    VM1 <--> M2
+
+    VTO1 <--> IO1
+    DTO1 <--> IO1
+
+    class IT1,IT2,PT1,PT2,OT1,OT2 blue
+    class I1,I2,FS1,EUI1 yellow
+    class P1,P2,M1,M2,VM1 orange
+    class O1,O2,IO1,VTO1,DTO1 red
+
+    classDef blue   fill:#e3f2fd,stroke:#1565c0,color:#0d47a1
+    classDef yellow fill:#fffde7,stroke:#f9a825,color:#f57f17
+    classDef orange fill:#fff3e0,stroke:#ef6c00,color:#e65100
+    classDef red fill:#ffebee,stroke:#c62828,color:#b71c1c
 ```
 
-Built on [helium/oracles](https://github.com/helium/oracles): `file_store`
-polls the buckets, `helium_iceberg` writes the tables.
+Blue boxes are tasks, yellow are inputs, orange are processors and their
+middleware, red are outputs.
 
-## What you implement
+- Every input runs in its own task and feeds its own processor through a
+  channel.
+- Every processor runs its own instance of the route's middleware, and sends
+  each output the records routed to it, through one channel per output.
+- Every output runs in its own task, fed by every processor.
+- Channels hold one batch besides the one being handled: a slow stage makes
+  the stages before it wait.
 
-| Trait | Does |
+## Crates
+
+| Crate | Does |
 |---|---|
-| `GlaconRecord` | The route's record type. Optional `dedup_key()`; `None` means never deduplicated. |
-| `GlaconInput` | One kind of file: file prefix + protobuf message → record. Returning `None` drops the message (logged at error, counted). |
-| `GlaconMiddleware` | Record → `Destination::All` (default), `Only(outputs)` or `Drop`. Created by `middleware_with`, which looks its outputs up by name (an unknown name fails `build()`). |
-| `GlaconOutput` | One table: its definition + record → 0..n rows. |
+| `glacon-core` | The route and its tasks. Knows nothing of S3 or Iceberg: inputs, middlewares and outputs are traits. Depends on oracles' `task-manager` only. |
+| `glacon-helium` | `FileStoreInput` (polls a bucket with oracles' `file_store`) and `IcebergOutput` (writes a table with `helium_iceberg`). Re-exports everything from `glacon-core`, so apps depend on it alone. |
+| `glacon-test-proto` | Protobuf messages for the tests. |
+
+## Hooks
+
+Every stage has the same lifecycle, all async:
+
+| Trait (core) | `init` | main hook | `terminate` |
+|---|---|---|---|
+| `GlaconCoreInput` | prepare to read (e.g. start a poller) | `next_batch()`: the next `Batch`, or `None` when done | release what `init` set up |
+| `GlaconCoreMiddleware` | prepare (e.g. open a connection) | `handle_data(&[R])`: one `Destination` per record (`All`, `Only(outputs)` or `Drop`) | release |
+| `GlaconCoreOutput` | prepare to write (e.g. create the table) | `handle_data(&[&R])`: write the records routed here | flush, then release |
+
+`init` and `terminate` default to doing nothing. A stage keeps its own state
+in `self`; the `*Context` handed to `init` names the route and the stage. Any
+`Send + Sync + 'static` type is a record (`GlaconRecord`).
+
+Core has no state and no deduplication: a middleware that drops what it
+already saw is user code (see `deduplication_is_a_middleware` in
+`glacon-core/tests/integration/routing.rs`).
+
+### Up and down
+
+**Up:** before any task starts, the route initializes its stages layer by
+layer: every output, then every input's middleware, then every input. If an
+`init` fails, the layers already initialized are terminated and the route
+fails.
+
+**Down:** the stages stop in reverse: inputs, then processors (handling what
+is queued), then outputs (writing what is queued). Each runs its stage's
+`terminate` as it stops. A stage always terminates after everything feeding
+it:
+
+- on shutdown: the route's TaskManager stops its tasks in that order;
+- when every input is done: inputs return, their processors drain and stop,
+  then the outputs drain and stop, and the route ends;
+- on failure: the failing stage stops, the stages upstream of it stop first,
+  then the rest of the route goes down in order, and the route fails with the
+  stage's error (`Error::Input`, `Middleware`, `Output` or `Panic`).
+
+## Usage
 
 ```rust
-let route = Route::builder("events", RouteSettings::new("/var/lib/glacon/events"))
-    .input("us", EventV1Input, us_input_settings)
-    .input("eu", EventV2Input, eu_input_settings)
-    .output("lake", EventsTable, lake_settings)
-    .output("values", ValuesTable, values_settings)
-    // Created during build(), with the ids of the outputs it selects.
+use glacon_helium::{
+    BoxError, Destination, FileStoreInput, GlaconCoreMiddleware, IcebergOutput, OutputId, Route,
+    async_trait, task_manager::TaskManager,
+};
+
+// One instance per input's processor.
+struct VerifySpeedTest {
+    verified: OutputId,
+    dropped: OutputId,
+}
+
+#[async_trait]
+impl GlaconCoreMiddleware<SpeedTest> for VerifySpeedTest {
+    async fn handle_data(&mut self, tests: &[SpeedTest]) -> Result<Vec<Destination>, BoxError> {
+        Ok(tests
+            .iter()
+            .map(|t| if t.is_valid() { self.verified.into() } else { self.dropped.into() })
+            .map(Destination::Only)
+            .collect())
+    }
+}
+
+let route = Route::builder("speedtests")
+    .input("us", FileStoreInput::new(SpeedTestInput, us_settings, pool.clone()))
+    .input("eu", FileStoreInput::new(SpeedTestInput, eu_settings, pool.clone()))
+    .output("verified", IcebergOutput::new(VerifiedTable, verified_settings))
+    .output("dropped", IcebergOutput::new(DroppedTable, dropped_settings))
+    // Output names become ids: a typo fails build().
     .middleware_with(|outputs| {
-        Ok(MyMiddleware {
-            lake: outputs.id("lake")?,
-            values: outputs.id("values")?,
+        Ok(VerifySpeedTest {
+            verified: outputs.id("verified")?,
+            dropped: outputs.id("dropped")?,
         })
     })
     .build()?;
 
-Glacon::new().route(route).run().await?;
+TaskManager::builder().add_task(route).build().start().await?;
 ```
 
-`RouteSettings`, `InputSettings` and `OutputSettings` are serde-ready so apps
-can embed them in their own configuration.
+- A route has one middleware. `middleware_with` builds it from the outputs'
+  ids: it runs once in `build()` to check the names, then once per input
+  when the route starts. `middleware(m)` clones `m` for each input instead.
+  Without either, every record goes to every output (`AllOutputs`).
+- `Route` names its tasks `input <name>`, `processor <name>` and
+  `output <name>` in the TaskManager's logs.
 
-## How a route runs
+## glacon-helium
 
-Each route is one task with its own task manager: N pollers feed one
-processor, which feeds M writers. Here with inputs `us`/`eu` and outputs
-`lake`/`archive`, labelled with the files that implement each part:
+| You implement | Wrapped by | Does |
+|---|---|---|
+| `GlaconInput` | `FileStoreInput::new(input, InputSettings, state)` | One kind of file: file prefix + protobuf message → record. Returning `None` drops the message (logged at error, counted). |
+| `GlaconOutput` | `IcebergOutput::new(output, OutputSettings)` | One table: its definition + record → 0..n rows. |
 
-```mermaid
-flowchart TB
-    classDef glacon fill:#EEEDFE,stroke:#534AB7,color:#3C3489
-    classDef oracles fill:#F1EFE8,stroke:#5F5E5A,color:#444441
-    classDef state fill:#E1F5EE,stroke:#0F6E56,color:#085041
+`InputSettings` and `OutputSettings` are serde-ready so apps can embed them in
+their own configuration.
 
-    bus[("S3 bucket us")]:::oracles
-    beu[("S3 bucket eu")]:::oracles
-    pus["Poller us (file_store)<br/>input/runtime/poller_state.rs"]:::oracles
-    peu["Poller eu (file_store)<br/>input/runtime/poller_state.rs"]:::oracles
-    dus["decode() with Input V1<br/>input/runtime/entry.rs"]:::glacon
-    deu["decode() with Input V2<br/>input/runtime/entry.rs"]:::glacon
-    merge["Merged stream (select_all)<br/>route/mod.rs"]:::glacon
-    proc["Processor, one file at a time<br/>route/processor.rs"]:::glacon
-    db[("state.db<br/>state.rs")]:::state
-    slake["BatchedSink lake<br/>output/runtime/batched_sink.rs"]:::glacon
-    sarch["BatchedSink archive<br/>output/runtime/batched_sink.rs"]:::glacon
-    wlake["BatchedWriterTask lake<br/>helium_iceberg, spool/lake/"]:::oracles
-    warch["BatchedWriterTask archive<br/>helium_iceberg, spool/archive/"]:::oracles
-    tlake[("Iceberg table lake")]:::oracles
-    tarch[("Iceberg table archive")]:::oracles
+**`FileStoreInput`** polls one bucket. In `init` it starts the `file_store`
+poller (named after the input); `next_batch` decodes the next file into a
+batch; `terminate` stops the poller. When the poller stops on its own (its
+`idle_timeout`), the input is done; if it fails, the route does.
 
-    bus --> pus --> dus --> merge
-    beu --> peu --> deu --> merge
-    merge --> proc
-    proc --> slake --> wlake -- "commit on size / timeout" --> tlake
-    proc --> sarch --> warch -- "commit on size / timeout" --> tarch
-    proc <--> db
-    pus -. "processed_files" .-> db
-    peu -. "processed_files" .-> db
-```
+What the poller read is kept in a `PollerState`:
 
-Purple is glacon code, gray is oracles crates and storage, green is the
-route's state.
+- `sqlx::PgPool`: file_store's `files_processed` table, which the app creates
+  (see `PollerState`'s docs for the schema). A restart resumes where the last
+  run stopped.
+- `MemoryState`: in memory; a restart starts over from `start_after`.
 
-What the processor does with one file, and which `state.db` table each step
-touches:
+A file is recorded when it is read, before it is written anywhere: core tracks
+nothing, so on a crash, what was in flight is lost rather than duplicated.
 
-```mermaid
-flowchart TB
-    classDef glacon fill:#EEEDFE,stroke:#534AB7,color:#3C3489
-    classDef state fill:#E1F5EE,stroke:#0F6E56,color:#085041
-
-    file["DecodedFile from us or eu<br/>input/runtime/decoded_file.rs"]:::glacon
-    dedup["dedup(): repeats in the file, then known keys<br/>route/processor.rs, GlaconRecord::dedup_key"]:::glacon
-    mw["GlaconMiddleware::route() per record<br/>middleware/, Destination, OutputSet"]:::glacon
-    stage["stage() rows into lake / archive<br/>output/runtime/batched_sink.rs, GlaconOutput::to_rows"]:::glacon
-    flush["flush(): rows durable in each spool<br/>BatchedWriter::queue_all"]:::glacon
-    complete["complete_file(): one transaction<br/>state.rs"]:::glacon
-    prune["Prune dedup keys, emit metrics<br/>state.rs, metrics.rs"]:::glacon
-
-    keys[("dedup_keys")]:::state
-    inflight[("in_flight_deliveries")]:::state
-    processed[("processed_files")]:::state
-
-    file --> dedup --> mw --> stage --> flush --> complete --> prune
-    dedup -. "known_keys()" .-> keys
-    flush -. "skip outputs already done,<br/>record new ones" .-> inflight
-    complete -. "insert file" .-> processed
-    complete -. "upsert keys" .-> keys
-    complete -. "clear file's rows" .-> inflight
-```
-
-A file lands in `processed_files` only after every output has its rows durably
-in the spool. A crash before that means the file is read again, and
-`in_flight_deliveries` keeps an output that already took it from getting its
-rows twice.
-
-- Each input file is read once. The processor handles one file at a time, in
-  this order: decode, dedup, middleware, then each output's rows are spooled.
-  A slow output stalls its route.
-- Every output has a `helium_iceberg::BatchedWriter`: rows are spooled to disk,
-  then committed in batches (`max_batch_rows` / `batch_timeout`).
-- If any route fails, the whole process stops.
-
-## State
-
-`<state_dir>/state.db` (SQLite) is the route's only source of truth; nothing
-is read back from the tables. It holds:
-
-- `processed_files`: what each input has fully processed. It backs
-  `file_store`'s poller state (resume point and skipping re-listed files) and
-  is kept for `files_retention` (default 3 days).
-- `in_flight_deliveries`: outputs that already took a file still in progress, so a
-  re-read after a crash skips them.
-- `dedup_keys`: dedup key hashes shared by all inputs, kept for
-  `dedup_retention` (default 3 days).
-
-`state_dir` must be durable. If a route starts with an empty state but an
-output table already has data (a lost volume, for example), it refuses to start
-unless built with `.fresh_state(FreshState::Proceed)`. Proceeding re-ingests
-from each input's `start_after`.
-
-Guarantee: at-least-once with a small duplicate window, narrowed by dedup.
-
-## Constraints
+**`IcebergOutput`** writes one table. In `init` it creates the namespace and
+table if missing and starts a `helium_iceberg::BatchedWriter`, spooling to
+`<spool_dir>/<route>/<output>`; `handle_data` returns once the rows are in
+the spool; they are committed every `max_batch_rows` rows or `batch_timeout`,
+and on `terminate`.
 
 - Output tables must be partitioned: `helium_iceberg` cannot write to an
   unpartitioned table.
-- Missing tables are created from `GlaconOutput::table()`. Schema changes are not
-  handled.
+- Missing tables are created from `GlaconOutput::table()`. Schema changes are
+  not handled.
 - At most 64 outputs per route.
 
 ## Metrics
@@ -160,31 +228,37 @@ Guarantee: at-least-once with a small duplicate window, narrowed by dedup.
 Emitted through the `metrics` facade (the app installs an exporter). Every
 series has a `route` label, plus `input` or `output` where it applies:
 
-- `glacon_processed_files_total`
-- `glacon_file_lag_seconds`
-- `glacon_file_processing_seconds`
-- `glacon_records_decoded_total`
-- `glacon_decode_failures_total`
-- `glacon_dedup_dropped_total`
+- `glacon_processed_batches_total`
+- `glacon_batch_lag_seconds`
+- `glacon_batch_processing_seconds`
 - `glacon_middleware_dropped_total`
 - `glacon_output_records_total`
-- `glacon_output_rows_total`
-- `glacon_state_pruned_total` (`kind` is `processed_files` or `dedup_keys`)
+- `glacon_records_decoded_total` (`FileStoreInput`)
+- `glacon_decode_failures_total` (`FileStoreInput`)
+- `glacon_output_rows_total` (`IcebergOutput`)
 
 ## Development
 
-The integration tests need RustFS, Polaris and Trino (`docker-compose.yml`;
-every config is inlined there) and `protoc` for the test messages:
+`glacon-core`'s tests run on their own, against in-memory inputs, middlewares
+and outputs:
+
+```bash
+cargo nextest run -p glacon-core
+```
+
+`glacon-helium`'s integration tests need RustFS, Polaris and Trino
+(`docker-compose.yml`; every config is inlined there) and `protoc` for the
+test messages:
 
 ```bash
 docker compose up -d --wait
-cargo nextest run
+cargo nextest run --workspace
 ```
 
 Use `cargo nextest run`, not `cargo test`: under `cargo test`, every test gets
 its own Tokio runtime inside one process, and `file_store`'s cached S3 clients
-then fail across runtimes. `.config/nextest.toml` also caps how many
-integration tests run at once against the shared Polaris.
+then fail across runtimes. `.config/nextest.toml` also caps how many of
+glacon-helium's integration tests run at once against the shared Polaris.
 
-The test environment (`tests/integration/common/harness.rs`) gives each test
-its own Iceberg catalog, buckets and state dirs.
+The test environment (`glacon-helium/tests/integration/common/harness.rs`)
+gives each test its own Iceberg catalog, buckets and spool directory.

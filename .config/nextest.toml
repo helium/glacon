@@ -3,5 +3,5 @@
 integration = { max-threads = 4 }
 
 [[profile.default.overrides]]
-filter = "binary(integration)"
+filter = "package(glacon-helium) & binary(integration)"
 test-group = "integration"
