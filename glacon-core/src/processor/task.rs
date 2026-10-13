@@ -1,12 +1,17 @@
 use super::middleware::{Destination, GlaconCoreMiddleware, MiddlewareContext, OutputId};
-use crate::{Batch, Error, GlaconRecord, Result, lifecycle::Lifecycle, metrics, output::Delivery};
+use crate::{
+    Batch, Error, GlaconRecord, Result,
+    lifecycle::{Initialized, Lifecycle, Terminate},
+    metrics,
+    output::Delivery,
+};
 use chrono::Utc;
 use futures::future;
 use std::{sync::Arc, time::Instant};
 use tokio::sync::{mpsc, oneshot};
 
-/// An input's middleware as the route manages it: with its context, behind
-/// [`Lifecycle`].
+/// An input's middleware with its context, the same before and after
+/// `init`.
 pub(crate) struct RouteMiddleware<R> {
     pub ctx: MiddlewareContext,
     pub middleware: Box<dyn GlaconCoreMiddleware<R>>,
@@ -14,17 +19,20 @@ pub(crate) struct RouteMiddleware<R> {
 
 #[async_trait::async_trait]
 impl<R: GlaconRecord> Lifecycle for RouteMiddleware<R> {
-    fn describe(&self) -> String {
-        format!("middleware of input {}", self.ctx.input)
-    }
+    type Started = Self;
 
-    async fn init(&mut self) -> Result {
+    async fn init(mut self) -> Result<Initialized<Self>> {
         self.middleware
             .init(&self.ctx)
             .await
-            .map_err(|e| Error::middleware(&self.ctx.route, &self.ctx.input, e))
+            .map_err(|e| Error::middleware(&self.ctx.route, &self.ctx.input, e))?;
+        // Middlewares have no background task.
+        Ok((self, None))
     }
+}
 
+#[async_trait::async_trait]
+impl<R: GlaconRecord> Terminate for RouteMiddleware<R> {
     async fn terminate(&mut self) -> Result {
         self.middleware
             .terminate()

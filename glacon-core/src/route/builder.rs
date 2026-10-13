@@ -1,7 +1,7 @@
 use super::{Route, RouteParts};
 use crate::{
-    AllOutputs, Error, GlaconCoreInput, GlaconCoreMiddleware, GlaconCoreOutput, GlaconRecord,
-    MAX_OUTPUTS, OutputIndex, Result,
+    AllOutputs, Error, GlaconCoreInputInit, GlaconCoreMiddleware, GlaconCoreOutputInit,
+    GlaconRecord, MAX_OUTPUTS, OutputIndex, Result,
 };
 use std::{collections::HashSet, sync::Mutex};
 
@@ -42,15 +42,15 @@ impl<R: GlaconRecord> Route<R> {
 /// ```
 pub struct RouteBuilder<R> {
     name: String,
-    inputs: Vec<(String, Box<dyn GlaconCoreInput<R>>)>,
+    inputs: Vec<(String, Box<dyn GlaconCoreInputInit<R>>)>,
     middleware: Option<MiddlewareFactory<R>>,
-    outputs: Vec<(String, Box<dyn GlaconCoreOutput<R>>)>,
+    outputs: Vec<(String, Box<dyn GlaconCoreOutputInit<R>>)>,
 }
 
 impl<R: GlaconRecord> RouteBuilder<R> {
     /// Add an input. `name` identifies it in logs and metrics, and to the
     /// input itself through its context, so keep it stable.
-    pub fn input(mut self, name: impl Into<String>, input: impl GlaconCoreInput<R>) -> Self {
+    pub fn input(mut self, name: impl Into<String>, input: impl GlaconCoreInputInit<R>) -> Self {
         self.inputs.push((name.into(), Box::new(input)));
         self
     }
@@ -58,7 +58,7 @@ impl<R: GlaconRecord> RouteBuilder<R> {
     /// Add an output. `name` identifies it to the middleware (see
     /// [`RouteBuilder::middleware_with`]), in logs and metrics, so keep it
     /// stable.
-    pub fn output(mut self, name: impl Into<String>, output: impl GlaconCoreOutput<R>) -> Self {
+    pub fn output(mut self, name: impl Into<String>, output: impl GlaconCoreOutputInit<R>) -> Self {
         self.outputs.push((name.into(), Box::new(output)));
         self
     }
@@ -159,9 +159,18 @@ fn check_names<'a>(kind: &str, names: impl Iterator<Item = &'a str>) -> Result<(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{Batch, BoxError, Destination, OutputId};
+    use crate::{
+        Batch, BoxError, Destination, GlaconCoreInput, GlaconCoreOutput, InitializedInput,
+        InitializedOutput, InputContext, OutputContext, OutputId,
+    };
 
     struct In;
+    #[async_trait::async_trait]
+    impl GlaconCoreInputInit<()> for In {
+        async fn init(self: Box<Self>, _: &InputContext) -> Result<InitializedInput<()>, BoxError> {
+            Ok(InitializedInput::new(*self))
+        }
+    }
     #[async_trait::async_trait]
     impl GlaconCoreInput<()> for In {
         async fn next_batch(&mut self) -> Result<Option<Batch<()>>, BoxError> {
@@ -170,6 +179,15 @@ mod tests {
     }
 
     struct Out;
+    #[async_trait::async_trait]
+    impl GlaconCoreOutputInit<()> for Out {
+        async fn init(
+            self: Box<Self>,
+            _: &OutputContext,
+        ) -> Result<InitializedOutput<()>, BoxError> {
+            Ok(InitializedOutput::new(*self))
+        }
+    }
     #[async_trait::async_trait]
     impl GlaconCoreOutput<()> for Out {
         async fn handle_data(&mut self, _: &[&()]) -> Result<(), BoxError> {

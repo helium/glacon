@@ -1,6 +1,6 @@
 use std::sync::Arc;
 
-/// Handed to [`GlaconCoreOutput::init`](super::GlaconCoreOutput::init).
+/// Handed to [`GlaconCoreOutputInit::init`](super::GlaconCoreOutputInit::init).
 #[derive(Debug, Clone)]
 pub struct OutputContext {
     pub(crate) route: Arc<str>,

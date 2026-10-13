@@ -5,31 +5,23 @@ use super::{
 use crate::metrics;
 use ::file_store::{file_info_poller::FileInfoStream, file_source};
 use futures::StreamExt;
-use glacon_core::{Batch, BoxError, GlaconCoreInput, InputContext};
-use tokio::{sync::mpsc, task::JoinHandle};
+use glacon_core::{
+    Batch, BoxError, GlaconCoreInput, GlaconCoreInputInit, InitializedInput, InputContext,
+};
+use tokio::sync::mpsc;
 
 /// A [`GlaconCoreInput`] polling one S3 bucket with `file_store`: each file
 /// is one batch, its protobuf messages decoded by a [`GlaconInput`]. What it
-/// read is kept in a [`PollerState`].
+/// read is kept in a [`PollerState`]. The poller is its background task,
+/// supervised by the route.
 ///
 /// ```ignore
 /// route.input("us", FileStoreInput::new(SpeedTestInput, us_settings, pool.clone()));
 /// ```
-pub struct FileStoreInput<I: GlaconInput, S> {
+pub struct FileStoreInput<I, S> {
     input: I,
     settings: InputSettings,
     state: S,
-    /// Set by `init`.
-    polling: Option<Polling<I::Proto>>,
-}
-
-/// The running poller.
-struct Polling<P> {
-    ctx: InputContext,
-    files: mpsc::Receiver<FileInfoStream<P>>,
-    stop: triggered::Trigger,
-    /// `None` once joined.
-    poller: Option<JoinHandle<::file_store::Result>>,
 }
 
 impl<I: GlaconInput, S: PollerState> FileStoreInput<I, S> {
@@ -38,25 +30,32 @@ impl<I: GlaconInput, S: PollerState> FileStoreInput<I, S> {
             input,
             settings,
             state,
-            polling: None,
         }
     }
 }
 
 #[async_trait::async_trait]
-impl<I, S> GlaconCoreInput<I::Record> for FileStoreInput<I, S>
+impl<I, S> GlaconCoreInputInit<I::Record> for FileStoreInput<I, S>
 where
     I: GlaconInput,
     S: PollerState,
 {
-    /// Connect to the bucket and start polling it.
-    async fn init(&mut self, ctx: &InputContext) -> Result<(), BoxError> {
-        let settings = &self.settings;
+    /// Connect to the bucket and build its poller: the poller is returned for
+    /// the route to run, and the running input receives the files it finds.
+    async fn init(
+        self: Box<Self>,
+        ctx: &InputContext,
+    ) -> Result<InitializedInput<I::Record>, BoxError> {
+        let FileStoreInput {
+            input,
+            settings,
+            state,
+        } = *self;
         let bucket = settings.bucket.connect().await;
         let builder = file_source::Continuous::prost_source::<I::Proto, _, _>()
-            .state(self.state.clone())
+            .state(state.clone())
             .bucket_client(bucket)
-            .prefix(self.input.prefix())
+            .prefix(input.prefix())
             .process_name(ctx.input().to_string())
             .lookback_start_after(settings.start_after)
             .poll_duration_opt(settings.poll_duration)
@@ -66,49 +65,40 @@ where
             None => builder,
         };
         let (files, poller) = builder.create().await?;
-        let (stop, stopped) = triggered::trigger();
 
-        self.polling = Some(Polling {
+        let running = RunningFileStoreInput {
+            input,
+            state,
             ctx: ctx.clone(),
             files,
-            stop,
-            poller: Some(tokio::spawn(poller.run(stopped))),
-        });
-        Ok(())
-    }
-
-    /// The next file, decoded. `None` once the poller stopped on its own
-    /// (idle timeout); its error if it failed.
-    async fn next_batch(&mut self) -> Result<Option<Batch<I::Record>>, BoxError> {
-        let polling = self.polling.as_mut().ok_or("not initialized")?;
-        match polling.files.recv().await {
-            Some(file) => Ok(Some(
-                decode(&self.input, &self.state, &polling.ctx, file).await?,
-            )),
-            None => {
-                polling.join().await?;
-                Ok(None)
-            }
-        }
-    }
-
-    /// Stop the poller and wait for it.
-    async fn terminate(&mut self) -> Result<(), BoxError> {
-        match self.polling.take() {
-            Some(mut polling) => {
-                polling.stop.trigger();
-                polling.join().await
-            }
-            None => Ok(()),
-        }
+        };
+        Ok(InitializedInput::new(running).with_task(poller))
     }
 }
 
-impl<P> Polling<P> {
-    async fn join(&mut self) -> Result<(), BoxError> {
-        match self.poller.take() {
-            Some(poller) => Ok(poller.await??),
-            None => Ok(()),
+/// A [`FileStoreInput`] once initialized: decodes the files its poller sends.
+struct RunningFileStoreInput<I: GlaconInput, S> {
+    input: I,
+    state: S,
+    ctx: InputContext,
+    files: mpsc::Receiver<FileInfoStream<I::Proto>>,
+}
+
+#[async_trait::async_trait]
+impl<I, S> GlaconCoreInput<I::Record> for RunningFileStoreInput<I, S>
+where
+    I: GlaconInput,
+    S: PollerState,
+{
+    /// The next file, decoded. `None` once the poller stopped (its idle
+    /// timeout, or an error, which the route reports from the poller's
+    /// task).
+    async fn next_batch(&mut self) -> Result<Option<Batch<I::Record>>, BoxError> {
+        match self.files.recv().await {
+            Some(file) => Ok(Some(
+                decode(&self.input, &self.state, &self.ctx, file).await?,
+            )),
+            None => Ok(None),
         }
     }
 }

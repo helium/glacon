@@ -11,19 +11,19 @@ The examples use one route, `events`, with one input `us` (a
 A *task* is a Tokio task: a future started with `tokio::spawn` that the
 runtime schedules on its worker threads. A route is an oracles
 `ManagedTask`; once started, it runs one task per input, one processor per
-input and one task per output. glacon-helium's input and output each start
-one more task of their own.
+input and one task per output, plus the background task each input or output
+returned from `init` (glacon-helium's poller and writer).
 
 ```text
 your task (e.g. main, calling task_manager.start().await)
 └─ your TaskManager                    ← not spawned: runs inside your task
    └─ route task "events"              ← spawned (one per route)
       └─ route's own TaskManager       ← not spawned: runs inside the route task
+         ├─ "output lake: background"  ← spawned: the writer IcebergOutput::init returned
          ├─ output task "lake"         ← spawned
-         │  └─ writer task             ← spawned by IcebergOutput::init (helium_iceberg)
          ├─ processor task "us"        ← spawned
+         ├─ "input us: background"     ← spawned: the poller FileStoreInput::init returned
          └─ input task "us"            ← spawned
-            └─ poller task             ← spawned by FileStoreInput::init (file_store)
 ```
 
 - **Your `TaskManager`** runs routes next to your other tasks. Routes are
@@ -34,14 +34,16 @@ your task (e.g. main, calling task_manager.start().await)
   route's own `TaskManager`: it waits on the stage tasks, stops them in order,
   and fails if one of them fails. No data passes through it.
 - **The input task** ([input/task.rs](../glacon-core/src/input/task.rs))
-  calls your input's `next_batch` and sends each batch to its processor.
+  calls your running input's `next_batch` and sends each batch to its
+  processor.
 - **The processor task** ([processor/task.rs](../glacon-core/src/processor/task.rs))
   runs the input's own middleware over each batch and sends every output the
   records routed to it.
 - **The output task** ([output/task.rs](../glacon-core/src/output/task.rs))
-  calls your output's `handle_data` with those records.
-- **Poller and writer tasks** are `file_store` and `helium_iceberg` tasks,
-  started and stopped by `FileStoreInput` and `IcebergOutput`.
+  calls your running output's `handle_data` with those records.
+- **Background tasks** are what an input's or output's `init` returned: for
+  glacon-helium, the `file_store` poller and the `helium_iceberg` writer.
+  The route starts and stops them like its own tasks, and fails if they do.
 
 A route with N inputs and M outputs therefore runs 1 + 2N + M tasks, plus N
 pollers and M writers with glacon-helium. The parent/child links are
@@ -49,24 +51,25 @@ pollers and M writers with glacon-helium. The parent/child links are
 peers on any worker thread.
 
 Before any task starts, the route initializes outputs, then middlewares, then
-inputs. Tasks are added outputs first, then processors, then inputs, and stop
-in the reverse order: inputs stop reading, processors handle what is queued,
-then outputs write what is queued and terminate (`IcebergOutput` commits its
-spool).
+inputs. Tasks are added output backgrounds, outputs, processors, input
+backgrounds, then inputs, and stop in the reverse order: inputs stop reading,
+then their pollers stop, processors handle what is queued, outputs write what
+is queued and terminate, then their writers commit their spools and stop. A
+background task always starts before its stage and stops after it.
 
 ## Where your code runs
 
 | Your code | Task | When |
 |---|---|---|
 | `middleware_with(...)` factory | the caller of `build()`, then the route task | once in `build()` to check output names, then once per input at start |
-| `GlaconCoreOutput::init` (`IcebergOutput`: `GlaconOutput::table()`) | route | once per output, at start |
+| `GlaconCoreOutputInit::init` (`IcebergOutput`: `GlaconOutput::table()`), returning the running output and its background task | route | once per output, at start |
 | `GlaconCoreMiddleware::init` | route | once per input, at start |
-| `GlaconCoreInput::init` | route | once per input, at start |
+| `GlaconCoreInputInit::init`, returning the running input and its background task | route | once per input, at start |
 | `GlaconCoreInput::next_batch` (`FileStoreInput`: `GlaconInput::decode`) | input | per batch (per message for `decode`) |
 | `GlaconCoreMiddleware::handle_data` | processor | per batch |
 | `GlaconCoreOutput::handle_data` (`IcebergOutput`: `GlaconOutput::to_rows`) | output | per batch routed to it (per record for `to_rows`) |
 | `serde::Serialize` of your `Row` | writer | when rows are converted to Arrow |
-| `terminate` of each | its own task | when it stops (the route task when undoing a failed start) |
+| `terminate` of middlewares and outputs | its own task | when it stops (the route task when undoing a failed start) |
 
 `GlaconInput::decode`, `GlaconOutput::table` / `to_rows` and the middleware
 factory are synchronous; the `GlaconCore*` hooks are async.
@@ -81,14 +84,15 @@ code.
 | # | Step | Kind | Task | Code |
 |---|---|---|---|---|
 | 1 | Init every output at once: connect the catalog, `GlaconOutput::table()` (yours), create namespace and table if missing | async (HTTP) | route | `route/mod.rs` `up`, `lifecycle.rs` `init_all`, `output/iceberg/output.rs` `init` |
-| 2 | `BatchedWriter::new` and spawn the writer task, spooling to `<spool_dir>/events/lake` | sync (spawn) | route | `IcebergOutput::init` |
+| 2 | `BatchedWriter::new`, spooling to `<spool_dir>/events/lake`; return its task | sync | route | `IcebergOutput::init` |
 | 3 | Per input: run the middleware factory (yours), then every middleware's `init` (yours) at once | sync + async | route | `up` |
 | 4 | Init every input at once: connect the bucket, create the poller, load its resume point from the `PollerState` | async (S3 + state) | route | `input/file_store/input.rs` `init` |
-| 5 | Spawn the poller task | sync (spawn) | route | `FileStoreInput::init` |
-| 6 | Wire the channels; start the route's TaskManager: output, processor, input tasks | sync (spawn) | route | `route/mod.rs` `wire` |
+| 5 | Return the poller as the input's background task | sync | route | `FileStoreInput::init` |
+| 6 | Wire the channels; start the route's TaskManager: writer, output, processor, poller, input tasks | sync (spawn) | route | `route/mod.rs` `wire` |
 
 If any `init` fails, the ones that succeeded in its layer and every earlier
-layer are terminated, and the route fails without starting a task.
+layer are terminated, the background tasks they returned are dropped, and the
+route fails without starting a task.
 
 ### 2. Writer startup (once, before the writer accepts rows)
 
@@ -149,16 +153,18 @@ layer are terminated, and the route fails without starting a task.
 
 | # | Step | Kind | Task | Code |
 |---|---|---|---|---|
-| 32 | Input stops reading; `terminate` (yours): `FileStoreInput` stops the poller and waits for it | async | input `us` | `input/task.rs` `run` |
-| 33 | Processor handles what is queued, waits for its input to have terminated, then `terminate` of its middleware (yours) | async | processor `us` | `processor/task.rs` `run` |
-| 34 | Output writes what is queued, then `terminate` (yours): `IcebergOutput` drops its writer handle and stops it | async | output `lake` | `output/task.rs` `run` |
-| 35 | Writer: final commit of the spool, then exits | async (disk + S3 + HTTP) | writer `lake` | `run` |
-| 36 | Route's TaskManager finishes; route task returns | async | route | `route/mod.rs` `run` |
+| 32 | Input stops reading; the input is dropped | async | input `us` | `input/task.rs` `run` |
+| 33 | Poller stops | async | input `us`: background | `file_store` `FileInfoPollerServer::run` |
+| 34 | Processor handles what is queued, waits for its input to be gone, then `terminate` of its middleware (yours) | async | processor `us` | `processor/task.rs` `run` |
+| 35 | Output writes what is queued, then `terminate` (yours); the output is dropped with its writer handle | async | output `lake` | `output/task.rs` `run` |
+| 36 | Writer: final commit of the spool, then exits | async (disk + S3 + HTTP) | output `lake`: background | `BatchedWriterTask::run` |
+| 37 | Route's TaskManager finishes; route task returns | async | route | `route/mod.rs` `run` |
 
 On shutdown, the route's TaskManager stops the tasks in this order. When the
 input is done (the poller stopped after `idle_timeout`), the same order
-follows from the channels: the input returns, its processor sees its channel
-close, then the outputs see every processor gone.
+follows from the channels: the poller closes its channel, the input returns,
+its processor sees its channel close, the outputs see every processor gone,
+and each writer sees its output's handle dropped.
 
 ### Reading the trace
 

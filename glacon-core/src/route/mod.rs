@@ -3,7 +3,8 @@
 //!
 //! A [`Route`] is an oracles `ManagedTask`: run it in your app's
 //! `TaskManager`. It runs its own TaskManager, one task per stage, joined by
-//! channels:
+//! channels, plus the background task each input or output may return from
+//! `init`:
 //!
 //! ```text
 //! input task ──► processor task (middleware) ──┬──► output task
@@ -12,25 +13,26 @@
 //!
 //! Up: outputs, then middlewares, then inputs are initialized, layer by
 //! layer, before any task starts. Down: the TaskManager stops inputs first,
-//! then processors (handling what is queued), then outputs (writing what is
-//! queued); each runs its stage's `terminate` as it stops.
+//! then their background tasks, then processors (handling what is queued),
+//! then outputs (writing what is queued, then `terminate`), then their
+//! background tasks.
 
 mod builder;
 
 pub use builder::RouteBuilder;
 
 use crate::{
-    BoxError, GlaconCoreInput, GlaconCoreOutput, GlaconRecord, InputContext, MiddlewareContext,
-    OutputContext, OutputIndex, Result,
-    input::{self, RouteInput},
-    lifecycle::{init_all, terminate_all},
-    output::{self, RouteOutput},
+    BoxError, GlaconCoreInputInit, GlaconCoreOutputInit, GlaconRecord, InputContext,
+    MiddlewareContext, OutputContext, OutputIndex, Result,
+    input::{self, PendingInput, RouteInput},
+    lifecycle::{Initialized, init_all, terminate_all},
+    output::{self, PendingOutput, RouteOutput},
     processor::{self, OutputSender, RouteMiddleware},
-    task::RouteTask,
+    task::{BackgroundTask, Owner, RouteTask, unwrap_task_error},
 };
 use builder::MiddlewareFactory;
 use std::sync::{Arc, Mutex, PoisonError};
-use task_manager::{ManagedTask, TaskError, TaskFuture, TaskManager};
+use task_manager::{ManagedTask, TaskFuture, TaskManager};
 use tokio::sync::{mpsc, oneshot};
 
 /// Batches waiting in each channel, besides the one being handled: the
@@ -46,10 +48,10 @@ pub struct Route<R> {
 }
 
 struct RouteParts<R> {
-    inputs: Vec<(String, Box<dyn GlaconCoreInput<R>>)>,
+    inputs: Vec<(String, Box<dyn GlaconCoreInputInit<R>>)>,
     middleware: MiddlewareFactory<R>,
     index: OutputIndex,
-    outputs: Vec<(String, Box<dyn GlaconCoreOutput<R>>)>,
+    outputs: Vec<(String, Box<dyn GlaconCoreOutputInit<R>>)>,
 }
 
 impl<R: GlaconRecord> Route<R> {
@@ -82,19 +84,6 @@ async fn run<R: GlaconRecord>(
     result.map_err(unwrap_task_error)
 }
 
-/// The error the failing input, middleware or output returned. A
-/// TaskManager run as a task wraps its tasks' errors in another `TaskError`,
-/// so unwrap every layer.
-fn unwrap_task_error(error: TaskError) -> BoxError {
-    match error {
-        TaskError::Task(inner) => match inner.downcast::<TaskError>() {
-            Ok(nested) => unwrap_task_error(*nested),
-            Err(inner) => inner,
-        },
-        other => other.into(),
-    }
-}
-
 /// Initialize every stage, layer by layer, then wire them into the route's
 /// TaskManager. A failed init terminates the layers already initialized.
 async fn up<R: GlaconRecord>(route: &Arc<str>, parts: RouteParts<R>) -> Result<TaskManager> {
@@ -108,12 +97,12 @@ async fn up<R: GlaconRecord>(route: &Arc<str>, parts: RouteParts<R>) -> Result<T
     let outputs = init_all(
         outputs
             .into_iter()
-            .map(|(name, output)| RouteOutput {
+            .map(|(name, init)| PendingOutput {
                 ctx: OutputContext {
                     route: route.clone(),
                     output: name.into(),
                 },
-                output,
+                init,
             })
             .collect(),
     )
@@ -135,10 +124,11 @@ async fn up<R: GlaconRecord>(route: &Arc<str>, parts: RouteParts<R>) -> Result<T
         Ok(middlewares) => init_all(middlewares).await,
         Err(error) => Err(error),
     };
-    let middlewares = match middlewares {
-        Ok(middlewares) => middlewares,
+    // Middlewares have no background task.
+    let middlewares: Vec<_> = match middlewares {
+        Ok(middlewares) => middlewares.into_iter().map(|(m, _)| m).collect(),
         Err(error) => {
-            terminate_all(outputs).await;
+            terminate_all(stages(outputs)).await;
             return Err(error);
         }
     };
@@ -146,12 +136,12 @@ async fn up<R: GlaconRecord>(route: &Arc<str>, parts: RouteParts<R>) -> Result<T
     let inputs = init_all(
         inputs
             .into_iter()
-            .map(|(name, input)| RouteInput {
+            .map(|(name, init)| PendingInput {
                 ctx: InputContext {
                     route: route.clone(),
                     input: name.into(),
                 },
-                input,
+                init,
             })
             .collect(),
     )
@@ -160,7 +150,7 @@ async fn up<R: GlaconRecord>(route: &Arc<str>, parts: RouteParts<R>) -> Result<T
         Ok(inputs) => inputs,
         Err(error) => {
             terminate_all(middlewares).await;
-            terminate_all(outputs).await;
+            terminate_all(stages(outputs)).await;
             return Err(error);
         }
     };
@@ -168,15 +158,35 @@ async fn up<R: GlaconRecord>(route: &Arc<str>, parts: RouteParts<R>) -> Result<T
     Ok(wire(route, inputs, middlewares, outputs))
 }
 
-/// One task per stage, joined by channels. Tasks start in this order and
-/// stop in reverse: inputs, processors, outputs.
+/// The stages, without the background tasks they returned: those are
+/// dropped, never started.
+fn stages<S>(started: Vec<Initialized<S>>) -> Vec<S> {
+    started.into_iter().map(|(stage, _task)| stage).collect()
+}
+
+/// One task per stage, joined by channels, plus the background tasks inputs
+/// and outputs returned. Tasks start in this order and stop in reverse:
+///
+/// ```text
+/// output backgrounds, outputs, processors, input backgrounds, inputs
+/// ```
+///
+/// so a background task starts before its stage and stops after it.
 fn wire<R: GlaconRecord>(
     route: &Arc<str>,
-    inputs: Vec<RouteInput<R>>,
+    inputs: Vec<Initialized<RouteInput<R>>>,
     middlewares: Vec<RouteMiddleware<R>>,
-    outputs: Vec<RouteOutput<R>>,
+    outputs: Vec<Initialized<RouteOutput<R>>>,
 ) -> TaskManager {
     let mut tasks = TaskManager::builder();
+
+    let (outputs, output_backgrounds): (Vec<_>, Vec<_>) = outputs.into_iter().unzip();
+    for (route_output, task) in outputs.iter().zip(output_backgrounds) {
+        if let Some(task) = task {
+            let owner = Owner::Output(route_output.ctx.output.clone());
+            tasks = tasks.add_named(owner.task_name(), BackgroundTask::new(route, owner, task));
+        }
+    }
 
     let mut output_senders = Vec::with_capacity(outputs.len());
     for route_output in outputs {
@@ -191,6 +201,7 @@ fn wire<R: GlaconRecord>(
         );
     }
 
+    let (inputs, input_backgrounds): (Vec<_>, Vec<_>) = inputs.into_iter().unzip();
     let mut input_tasks = Vec::with_capacity(inputs.len());
     for (input, middleware) in inputs.into_iter().zip(middlewares) {
         let (batches, received) = mpsc::channel(CHANNEL_CAPACITY);
@@ -214,6 +225,13 @@ fn wire<R: GlaconRecord>(
     // Only processors hold output senders now: outputs stop after the last
     // processor does.
     drop(output_senders);
+
+    for ((input, _, _), task) in input_tasks.iter().zip(input_backgrounds) {
+        if let Some(task) = task {
+            let owner = Owner::Input(input.ctx.input.clone());
+            tasks = tasks.add_named(owner.task_name(), BackgroundTask::new(route, owner, task));
+        }
+    }
 
     for (input, batches, stopped) in input_tasks {
         let name = format!("input {}", input.ctx.input);

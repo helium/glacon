@@ -1,8 +1,11 @@
 //! Up and down: outputs, then middlewares, then inputs are initialized;
-//! inputs, then middlewares, then outputs are terminated, whatever stops the
-//! route.
+//! inputs, then middlewares, then outputs stop, whatever stops the route.
+//! Background tasks returned by `init` start before their stage and stop
+//! after it.
 
-use crate::common::{self, End, Journal, MemoryInput, MemoryOutput, batch, event};
+use crate::common::{
+    self, BackgroundEnd, ChannelInput, End, Journal, MemoryInput, MemoryOutput, batch, event,
+};
 use glacon_core::{Error, task_manager::TaskManager};
 
 fn outputs(journal: &Journal) -> (MemoryOutput, MemoryOutput) {
@@ -12,14 +15,14 @@ fn outputs(journal: &Journal) -> (MemoryOutput, MemoryOutput) {
     )
 }
 
-/// Every stage terminates after everything upstream of it: an input before
-/// its middleware, every middleware before any output, and every write of an
-/// output before it terminates.
+/// Every stage stops after everything upstream of it: an input (dropped)
+/// before its middleware terminates, every middleware before any output, and
+/// every write of an output before it terminates.
 fn assert_down_order(journal: &Journal) {
     let entries = journal.entries();
     let position = |entry: &str| entries.iter().position(|e| e == entry);
     for entry in &entries {
-        if let Some(input) = entry.strip_prefix("terminate input ") {
+        if let Some(input) = entry.strip_prefix("drop input ") {
             let middleware = position(&format!("terminate middleware {input}"));
             assert!(
                 middleware.is_some_and(|m| Some(m) > position(entry)),
@@ -122,8 +125,8 @@ async fn a_failing_input_fails_the_route() -> anyhow::Result<()> {
         "{err}"
     );
     assert_eq!(left.rows(), ["kept"], "what was read before still got out");
-    assert!(journal.contains("terminate input healthy"));
-    assert!(journal.contains("terminate input broken"));
+    assert!(journal.contains("drop input healthy"));
+    assert!(journal.contains("drop input broken"));
     assert_down_order(&journal);
     Ok(())
 }
@@ -173,7 +176,7 @@ async fn a_failing_output_fails_the_route() -> anyhow::Result<()> {
     );
     assert!(journal.contains("terminate output left"));
     assert!(journal.contains("terminate output right"));
-    assert!(journal.contains("terminate input us"));
+    assert!(journal.contains("drop input us"));
     Ok(())
 }
 
@@ -203,7 +206,8 @@ async fn a_failed_init_terminates_what_was_initialized() -> anyhow::Result<()> {
     let (left, right) = outputs(&journal);
     let mut broken = MemoryInput::new("broken", Vec::new(), End::Return, &journal);
     broken.fail_init = true;
-    let healthy = MemoryInput::new("healthy", Vec::new(), End::Return, &journal);
+    let mut healthy = MemoryInput::new("healthy", Vec::new(), End::Return, &journal);
+    healthy.background = Some(BackgroundEnd::UntilStopped);
 
     let route = common::route("init", vec![healthy, broken], &left, &right, &journal).build()?;
     let err = common::run(route).await.expect_err("must fail");
@@ -214,12 +218,13 @@ async fn a_failed_init_terminates_what_was_initialized() -> anyhow::Result<()> {
         "{err}"
     );
     // The healthy input, every middleware and every output are undone, in
-    // Down order.
+    // Down order; the background task the healthy input returned never ran.
     assert_down_order(&journal);
-    assert!(journal.contains("terminate input healthy"));
+    assert!(journal.contains("drop input healthy"));
     assert!(
-        !journal.contains("terminate input broken"),
-        "never initialized"
+        journal.positions("start").is_empty(),
+        "{:?}",
+        journal.entries()
     );
     assert_eq!(journal.positions("terminate middleware").len(), 2);
     Ok(())
@@ -293,7 +298,100 @@ async fn a_failing_route_stops_the_others_in_the_task_manager() -> anyhow::Resul
         "{err}"
     );
     // The healthy route went down gracefully.
-    assert!(journal.contains("terminate input forever"));
+    assert!(journal.contains("drop input forever"));
+    assert_down_order(&journal);
+    Ok(())
+}
+
+#[tokio::test]
+async fn background_tasks_stop_after_their_stage() -> anyhow::Result<()> {
+    let journal = Journal::default();
+    let (mut left, right) = outputs(&journal);
+    left.background = Some(BackgroundEnd::UntilStopped);
+    let mut forever = MemoryInput::new(
+        "forever",
+        vec![batch("f.1", vec![event("x", "left")])],
+        End::HoldOpen,
+        &journal,
+    );
+    forever.background = Some(BackgroundEnd::UntilStopped);
+
+    let route = common::route("background", vec![forever], &left, &right, &journal).build()?;
+    common::run_until(route, left.wait_for_rows(1)).await?;
+
+    assert_down_order(&journal);
+    journal.assert_before("start input forever", "stop input forever");
+    journal.assert_before("drop input forever", "stop input forever");
+    journal.assert_before("terminate output left", "stop output left");
+    Ok(())
+}
+
+#[tokio::test]
+async fn an_input_ends_when_its_background_task_does() -> anyhow::Result<()> {
+    let journal = Journal::default();
+    let (left, right) = outputs(&journal);
+    let feed = ChannelInput::new(
+        "feed",
+        vec![
+            batch("feed.1", vec![event("a", "left")]),
+            batch("feed.2", vec![event("b", "left")]),
+        ],
+        &journal,
+    );
+
+    let route = common::route("channel", Vec::new(), &left, &right, &journal)
+        .input(feed.name, feed)
+        .build()?;
+    common::run(route).await?;
+
+    assert_eq!(left.rows(), ["a", "b"]);
+    journal.assert_before("stop input feed", "terminate output");
+    Ok(())
+}
+
+#[tokio::test]
+async fn a_failing_background_task_fails_the_route() -> anyhow::Result<()> {
+    for side in ["input", "output"] {
+        let journal = Journal::default();
+        let (mut left, right) = outputs(&journal);
+        let mut input = MemoryInput::new("us", Vec::new(), End::HoldOpen, &journal);
+        match side {
+            "input" => input.background = Some(BackgroundEnd::Fail),
+            _ => left.background = Some(BackgroundEnd::Fail),
+        }
+
+        let route = common::route("background", vec![input], &left, &right, &journal).build()?;
+        let err = common::run(route).await.expect_err("must fail");
+
+        let err = common::route_error(&err);
+        let named = match err {
+            Error::Input { input, .. } => side == "input" && input == "us",
+            Error::Output { output, .. } => side == "output" && output == common::LEFT,
+            _ => false,
+        };
+        assert!(named, "{side}: {err}");
+        assert!(err.to_string().contains("background failure"), "{err}");
+        assert_down_order(&journal);
+    }
+    Ok(())
+}
+
+#[tokio::test]
+async fn a_panicking_background_task_fails_the_route() -> anyhow::Result<()> {
+    let journal = Journal::default();
+    let (left, right) = outputs(&journal);
+    let mut input = MemoryInput::new("us", Vec::new(), End::HoldOpen, &journal);
+    input.background = Some(BackgroundEnd::Panic);
+
+    let route = common::route("background", vec![input], &left, &right, &journal).build()?;
+    let err = common::run(route).await.expect_err("must fail");
+
+    let err = common::route_error(&err);
+    assert!(
+        matches!(err, Error::Panic { task, message, .. }
+            if task == "input us: background" && message == "background panic"),
+        "{err}"
+    );
     assert_down_order(&journal);
     Ok(())
 }

@@ -1,6 +1,6 @@
 use std::sync::Arc;
 
-/// Handed to [`GlaconCoreInput::init`](super::GlaconCoreInput::init).
+/// Handed to [`GlaconCoreInputInit::init`](super::GlaconCoreInputInit::init).
 #[derive(Debug, Clone)]
 pub struct InputContext {
     pub(crate) route: Arc<str>,

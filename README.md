@@ -102,17 +102,44 @@ middleware, red are outputs.
 
 ## Hooks
 
-Every stage has the same lifecycle, all async:
+Every stage follows the same lifecycle, all async: `init`, its main hook,
+then `terminate`.
 
-| Trait (core) | `init` | main hook | `terminate` |
+| Stage | `init` | main hook | `terminate` |
 |---|---|---|---|
-| `GlaconCoreInput` | prepare to read (e.g. start a poller) | `next_batch()`: the next `Batch`, or `None` when done | release what `init` set up |
-| `GlaconCoreMiddleware` | prepare (e.g. open a connection) | `handle_data(&[R])`: one `Destination` per record (`All`, `Only(outputs)` or `Drop`) | release |
-| `GlaconCoreOutput` | prepare to write (e.g. create the table) | `handle_data(&[&R])`: write the records routed here | flush, then release |
+| input | `GlaconCoreInputInit::init(self, ctx)`: connect, build a poller, …; returns the running `GlaconCoreInput` and an optional background task (`InitializedInput`) | `GlaconCoreInput::next_batch()`: the next `Batch`, or `None` when done | — (the running input is dropped) |
+| middleware | `GlaconCoreMiddleware::init(&mut self, ctx)`: open a connection, … | `handle_data(&[R])`: one `Destination` per record (`All`, `Only(outputs)` or `Drop`) | release |
+| output | `GlaconCoreOutputInit::init(self, ctx)`: connect, create the table, …; returns the running `GlaconCoreOutput` and an optional background task (`InitializedOutput`) | `GlaconCoreOutput::handle_data(&[&R])`: write the records routed here | `GlaconCoreOutput::terminate`: flush |
 
-`init` and `terminate` default to doing nothing. A stage keeps its own state
-in `self`; the `*Context` handed to `init` names the route and the stage. Any
-`Send + Sync + 'static` type is a record (`GlaconRecord`).
+An input's or output's `init` **consumes** its configuration (what you gave
+the builder, a `GlaconCoreInputInit` / `GlaconCoreOutputInit`) and returns
+the running `GlaconCoreInput` / `GlaconCoreOutput` its task drives, so that
+holds only what exists once started: no `Option` fields, no "not
+initialized" case. `FileStoreInput` and `IcebergOutput` keep their running
+types private (`RunningFileStoreInput` / `RunningIcebergOutput`). A stage
+with nothing to set up implements both traits and returns itself:
+`Ok(InitializedInput::new(*self))`.
+
+The middleware's `init` and `terminate` default to doing nothing, as does
+the running output's `terminate`. The `*Context` handed to `init` names the route and
+the stage. Any `Send + Sync + 'static` type is a record (`GlaconRecord`).
+
+### Background tasks
+
+An input's or output's `init` adds a task, an oracles `ManagedTask`, when it
+needs work running beside it: a poller feeding the running input, a writer
+committing the output's rows (`InitializedInput::new(running).with_task(poller)`).
+Several tasks can be bundled into one `TaskManager`. The route supervises it:
+
+- it is started before its stage and stopped after it: an input's task stops
+  once the input stopped reading, an output's once the output terminated;
+- its failure fails the route with the stage's error (`Error::Input` /
+  `Error::Output`), and a panic with `Error::Panic` naming it (e.g.
+  `input us: background`).
+
+`init` must not spawn anything itself: if another stage then fails to
+initialize, the route drops the returned tasks without ever starting them.
+Without a task, there is nothing to supervise.
 
 Core has no state and no deduplication: a middleware that drops what it
 already saw is user code (see `deduplication_is_a_middleware` in
@@ -125,10 +152,10 @@ layer: every output, then every input's middleware, then every input. If an
 `init` fails, the layers already initialized are terminated and the route
 fails.
 
-**Down:** the stages stop in reverse: inputs, then processors (handling what
-is queued), then outputs (writing what is queued). Each runs its stage's
-`terminate` as it stops. A stage always terminates after everything feeding
-it:
+**Down:** the stages stop in reverse: inputs, then their background tasks,
+then processors (handling what is queued, then the middleware's
+`terminate`), then outputs (writing what is queued, then `terminate`), then
+their background tasks. A stage always stops after everything feeding it:
 
 - on shutdown: the route's TaskManager stops its tasks in that order;
 - when every input is done: inputs return, their processors drain and stop,
@@ -200,10 +227,10 @@ TaskManager::builder().add_task(route).build().start().await?;
 `InputSettings` and `OutputSettings` are serde-ready so apps can embed them in
 their own configuration.
 
-**`FileStoreInput`** polls one bucket. In `init` it starts the `file_store`
-poller (named after the input); `next_batch` decodes the next file into a
-batch; `terminate` stops the poller. When the poller stops on its own (its
-`idle_timeout`), the input is done; if it fails, the route does.
+**`FileStoreInput`** polls one bucket. Its `init` builds the `file_store`
+poller (named after the input) and returns it as its background task;
+`next_batch` decodes the next file into a batch. When the poller stops on its
+own (its `idle_timeout`), the input is done; if it fails, the route does.
 
 What the poller read is kept in a `PollerState`:
 
@@ -215,11 +242,12 @@ What the poller read is kept in a `PollerState`:
 A file is recorded when it is read, before it is written anywhere: core tracks
 nothing, so on a crash, what was in flight is lost rather than duplicated.
 
-**`IcebergOutput`** writes one table. In `init` it creates the namespace and
-table if missing and starts a `helium_iceberg::BatchedWriter`, spooling to
-`<spool_dir>/<route>/<output>`; `handle_data` returns once the rows are in
-the spool; they are committed every `max_batch_rows` rows or `batch_timeout`,
-and on `terminate`.
+**`IcebergOutput`** writes one table. Its `init` creates the namespace and
+table if missing and returns the `helium_iceberg::BatchedWriter`'s task as
+its background task, spooling to `<spool_dir>/<route>/<output>`;
+`handle_data` returns once the rows are in the spool. They are committed
+every `max_batch_rows` rows or `batch_timeout`, and when the route stops the
+writer.
 
 - Output tables must be partitioned: `helium_iceberg` cannot write to an
   unpartitioned table.

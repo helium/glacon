@@ -6,11 +6,13 @@
 //! your app's `TaskManager`, alongside your other routes and tasks.
 //!
 //! This crate knows nothing of where records come from or go to. You
-//! provide, each with `init` / main hook / `terminate`:
-//! - a [`GlaconCoreInput`] per input: produces [`Batch`]es of records;
+//! provide:
+//! - a [`GlaconCoreInput`] per input, initialized into a
+//!   [`GlaconCoreInput`] that produces [`Batch`]es of records;
 //! - optionally a [`GlaconCoreMiddleware`]: record → which outputs (default:
 //!   every output);
-//! - a [`GlaconCoreOutput`] per output: writes the records routed to it.
+//! - a [`GlaconCoreOutput`] per output, initialized into a
+//!   [`GlaconCoreOutput`] that writes the records routed to it.
 
 mod error;
 mod input;
@@ -23,8 +25,8 @@ mod route;
 mod task;
 
 pub use error::{BoxError, Error, Result};
-pub use input::{Batch, GlaconCoreInput, InputContext};
-pub use output::{GlaconCoreOutput, OutputContext};
+pub use input::{Batch, GlaconCoreInput, GlaconCoreInputInit, InitializedInput, InputContext};
+pub use output::{GlaconCoreOutput, GlaconCoreOutputInit, InitializedOutput, OutputContext};
 pub use processor::middleware::{
     AllOutputs, Destination, GlaconCoreMiddleware, MAX_OUTPUTS, MiddlewareContext, OutputId,
     OutputIndex, OutputSet,

@@ -1,27 +1,38 @@
-use super::{Delivery, GlaconCoreOutput, OutputContext};
-use crate::{Error, GlaconRecord, Result, lifecycle::Lifecycle};
+use super::{Delivery, GlaconCoreOutput, GlaconCoreOutputInit, InitializedOutput, OutputContext};
+use crate::{
+    Error, GlaconRecord, Result,
+    lifecycle::{Initialized, Lifecycle, Terminate},
+};
 use tokio::sync::mpsc;
 
-/// Your output as the route manages it: with its context, behind
-/// [`Lifecycle`].
+/// Your output before `init`, with its context.
+pub(crate) struct PendingOutput<R> {
+    pub ctx: OutputContext,
+    pub init: Box<dyn GlaconCoreOutputInit<R>>,
+}
+
+/// Your output after `init`: the running output its task drives.
 pub(crate) struct RouteOutput<R> {
     pub ctx: OutputContext,
     pub output: Box<dyn GlaconCoreOutput<R>>,
 }
 
 #[async_trait::async_trait]
-impl<R: GlaconRecord> Lifecycle for RouteOutput<R> {
-    fn describe(&self) -> String {
-        format!("output {}", self.ctx.output)
-    }
+impl<R: GlaconRecord> Lifecycle for PendingOutput<R> {
+    type Started = RouteOutput<R>;
 
-    async fn init(&mut self) -> Result {
-        self.output
-            .init(&self.ctx)
+    async fn init(self) -> Result<Initialized<RouteOutput<R>>> {
+        let PendingOutput { ctx, init } = self;
+        let InitializedOutput { output, task } = init
+            .init(&ctx)
             .await
-            .map_err(|e| Error::output(&self.ctx.route, &self.ctx.output, e))
+            .map_err(|e| Error::output(&ctx.route, &ctx.output, e))?;
+        Ok((RouteOutput { ctx, output }, task))
     }
+}
 
+#[async_trait::async_trait]
+impl<R: GlaconRecord> Terminate for RouteOutput<R> {
     async fn terminate(&mut self) -> Result {
         self.output
             .terminate()

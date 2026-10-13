@@ -8,6 +8,6 @@ mod r#trait;
 
 pub use batch::Batch;
 pub use context::InputContext;
-pub use r#trait::GlaconCoreInput;
+pub use r#trait::{GlaconCoreInput, GlaconCoreInputInit, InitializedInput};
 
-pub(crate) use task::{RouteInput, run};
+pub(crate) use task::{PendingInput, RouteInput, run};

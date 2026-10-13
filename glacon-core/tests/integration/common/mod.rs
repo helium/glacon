@@ -1,12 +1,14 @@
-//! In-memory inputs, outputs and middleware. A [`Journal`] shared by
-//! everything in a test records every hook call, in order, so tests can
-//! assert on the Up and Down order.
+//! In-memory inputs, outputs, middleware and background tasks. A
+//! [`Journal`] shared by everything in a test records every hook call, in
+//! order, so tests can assert on the Up and Down order.
 
 use chrono::Utc;
 use glacon_core::{
-    Batch, BoxError, Destination, Error, GlaconCoreInput, GlaconCoreMiddleware, GlaconCoreOutput,
-    InputContext, MiddlewareContext, OutputContext, OutputId, Route, RouteBuilder, async_trait,
-    task_manager::{ManagedTask, TaskError, TaskResult},
+    Batch, BoxError, Destination, Error, GlaconCoreInput, GlaconCoreInputInit,
+    GlaconCoreMiddleware, GlaconCoreOutput, GlaconCoreOutputInit, InitializedInput,
+    InitializedOutput, InputContext, MiddlewareContext, OutputContext, OutputId, Route,
+    RouteBuilder, async_trait,
+    task_manager::{self, ManagedTask, TaskError, TaskFuture, TaskResult},
 };
 use std::{
     collections::VecDeque,
@@ -16,6 +18,7 @@ use std::{
     },
     time::Duration,
 };
+use tokio::sync::mpsc;
 
 pub const LEFT: &str = "left";
 pub const RIGHT: &str = "right";
@@ -94,15 +97,53 @@ impl Journal {
     }
 }
 
+// ---------------------------------------------------------------- background
+
+/// A background task an input or output returns from `init`: journals
+/// `start <name>` and `stop <name>`, and runs until stopped, fails or panics.
+#[derive(Clone)]
+pub struct Background {
+    pub name: String,
+    pub end: BackgroundEnd,
+    pub journal: Journal,
+}
+
+#[derive(Clone, Copy)]
+pub enum BackgroundEnd {
+    /// Runs until the route stops it.
+    UntilStopped,
+    Fail,
+    Panic,
+}
+
+impl ManagedTask for Background {
+    fn start_task(self: Box<Self>, shutdown: triggered::Listener) -> TaskFuture {
+        let Background { name, end, journal } = *self;
+        task_manager::spawn(async move {
+            journal.push(format!("start {name}"));
+            match end {
+                BackgroundEnd::UntilStopped => shutdown.await,
+                BackgroundEnd::Fail => return Err(BoxError::from("background failure")),
+                BackgroundEnd::Panic => panic!("background panic"),
+            }
+            journal.push(format!("stop {name}"));
+            Ok(())
+        })
+    }
+}
+
 // ---------------------------------------------------------------- input
 
 /// Hands out its batches, then returns, fails, panics or waits to be
-/// stopped.
+/// stopped. Its running input journals `drop input <name>` when dropped: the marker
+/// that its task ended.
 pub struct MemoryInput {
     pub name: &'static str,
     pub batches: VecDeque<Batch<Event>>,
     pub end: End,
     pub fail_init: bool,
+    /// Returned from `init` for the route to supervise.
+    pub background: Option<BackgroundEnd>,
     pub journal: Journal,
 }
 
@@ -127,22 +168,66 @@ impl MemoryInput {
             batches: batches.into(),
             end,
             fail_init: false,
+            background: None,
             journal: journal.clone(),
         }
     }
 }
 
 #[async_trait]
-impl GlaconCoreInput<Event> for MemoryInput {
-    async fn init(&mut self, ctx: &InputContext) -> Result<(), BoxError> {
-        assert_eq!(ctx.input(), self.name);
-        if self.fail_init {
+impl GlaconCoreInputInit<Event> for MemoryInput {
+    async fn init(
+        self: Box<Self>,
+        ctx: &InputContext,
+    ) -> Result<InitializedInput<Event>, BoxError> {
+        let MemoryInput {
+            name,
+            batches,
+            end,
+            fail_init,
+            background,
+            journal,
+        } = *self;
+        assert_eq!(ctx.input(), name);
+        if fail_init {
             return Err("input init failure".into());
         }
-        self.journal.push(format!("init input {}", self.name));
-        Ok(())
+        journal.push(format!("init input {name}"));
+        let task = background.map(|end| {
+            Box::new(Background {
+                name: format!("input {name}"),
+                end,
+                journal: journal.clone(),
+            }) as Box<dyn ManagedTask>
+        });
+        Ok(InitializedInput {
+            input: Box::new(RunningMemoryInput {
+                name,
+                batches,
+                end,
+                journal,
+            }),
+            task,
+        })
     }
+}
 
+/// A [`MemoryInput`] once initialized.
+struct RunningMemoryInput {
+    name: &'static str,
+    batches: VecDeque<Batch<Event>>,
+    end: End,
+    journal: Journal,
+}
+
+impl Drop for RunningMemoryInput {
+    fn drop(&mut self) {
+        self.journal.push(format!("drop input {}", self.name));
+    }
+}
+
+#[async_trait]
+impl GlaconCoreInput<Event> for RunningMemoryInput {
     async fn next_batch(&mut self) -> Result<Option<Batch<Event>>, BoxError> {
         if let Some(batch) = self.batches.pop_front() {
             return Ok(Some(batch));
@@ -154,16 +239,89 @@ impl GlaconCoreInput<Event> for MemoryInput {
             End::Panic => panic!("input panic"),
         }
     }
+}
 
-    async fn terminate(&mut self) -> Result<(), BoxError> {
-        self.journal.push(format!("terminate input {}", self.name));
-        Ok(())
+/// An input shaped like a poller: its background task produces the batches
+/// into a channel, then ends; the running input reads the channel, so it
+/// ends once the background task has.
+pub struct ChannelInput {
+    pub name: &'static str,
+    pub batches: Vec<Batch<Event>>,
+    pub journal: Journal,
+}
+
+impl ChannelInput {
+    pub fn new(name: &'static str, batches: Vec<Batch<Event>>, journal: &Journal) -> Self {
+        Self {
+            name,
+            batches,
+            journal: journal.clone(),
+        }
+    }
+}
+
+/// The background task of a [`ChannelInput`].
+struct Feeder {
+    name: String,
+    batches: Vec<Batch<Event>>,
+    sender: mpsc::Sender<Batch<Event>>,
+    journal: Journal,
+}
+
+impl ManagedTask for Feeder {
+    fn start_task(self: Box<Self>, _shutdown: triggered::Listener) -> TaskFuture {
+        let Feeder {
+            name,
+            batches,
+            sender,
+            journal,
+        } = *self;
+        task_manager::spawn(async move {
+            journal.push(format!("start {name}"));
+            for batch in batches {
+                if sender.send(batch).await.is_err() {
+                    break;
+                }
+            }
+            journal.push(format!("stop {name}"));
+            Ok::<_, BoxError>(())
+        })
+    }
+}
+
+/// A [`ChannelInput`] once initialized.
+struct RunningChannelInput(mpsc::Receiver<Batch<Event>>);
+
+#[async_trait]
+impl GlaconCoreInputInit<Event> for ChannelInput {
+    async fn init(self: Box<Self>, _: &InputContext) -> Result<InitializedInput<Event>, BoxError> {
+        let ChannelInput {
+            name,
+            batches,
+            journal,
+        } = *self;
+        let (sender, received) = mpsc::channel(1);
+        let feeder = Feeder {
+            name: format!("input {name}"),
+            batches,
+            sender,
+            journal,
+        };
+        Ok(InitializedInput::new(RunningChannelInput(received)).with_task(feeder))
+    }
+}
+
+#[async_trait]
+impl GlaconCoreInput<Event> for RunningChannelInput {
+    async fn next_batch(&mut self) -> Result<Option<Batch<Event>>, BoxError> {
+        Ok(self.0.recv().await)
     }
 }
 
 // ---------------------------------------------------------------- output
 
-/// Keeps the ids it was given.
+/// Keeps the ids it was given. Clones share them, so a test keeps one to
+/// read what the route wrote.
 #[derive(Clone)]
 pub struct MemoryOutput {
     pub name: &'static str,
@@ -171,6 +329,8 @@ pub struct MemoryOutput {
     /// Writes left to fail.
     failing_writes: Arc<AtomicUsize>,
     pub fail_init: bool,
+    /// Returned from `init` for the route to supervise.
+    pub background: Option<BackgroundEnd>,
     journal: Journal,
 }
 
@@ -181,6 +341,7 @@ impl MemoryOutput {
             rows: Default::default(),
             failing_writes: Default::default(),
             fail_init: false,
+            background: None,
             journal: journal.clone(),
         }
     }
@@ -216,16 +377,45 @@ impl MemoryOutput {
 }
 
 #[async_trait]
-impl GlaconCoreOutput<Event> for MemoryOutput {
-    async fn init(&mut self, ctx: &OutputContext) -> Result<(), BoxError> {
+impl GlaconCoreOutputInit<Event> for MemoryOutput {
+    async fn init(
+        self: Box<Self>,
+        ctx: &OutputContext,
+    ) -> Result<InitializedOutput<Event>, BoxError> {
         assert_eq!(ctx.output(), self.name);
         if self.fail_init {
             return Err("output init failure".into());
         }
         self.journal.push(format!("init output {}", self.name));
-        Ok(())
+        let task = self.background.map(|end| {
+            Box::new(Background {
+                name: format!("output {}", self.name),
+                end,
+                journal: self.journal.clone(),
+            }) as Box<dyn ManagedTask>
+        });
+        Ok(InitializedOutput {
+            output: Box::new(RunningMemoryOutput {
+                name: self.name,
+                rows: self.rows.clone(),
+                failing_writes: self.failing_writes.clone(),
+                journal: self.journal.clone(),
+            }),
+            task,
+        })
     }
+}
 
+/// A [`MemoryOutput`] once initialized.
+struct RunningMemoryOutput {
+    name: &'static str,
+    rows: Arc<Mutex<Vec<String>>>,
+    failing_writes: Arc<AtomicUsize>,
+    journal: Journal,
+}
+
+#[async_trait]
+impl GlaconCoreOutput<Event> for RunningMemoryOutput {
     async fn handle_data(&mut self, records: &[&Event]) -> Result<(), BoxError> {
         let fail = self
             .failing_writes
