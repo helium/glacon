@@ -137,6 +137,10 @@ it:
   then the rest of the route goes down in order, and the route fails with the
   stage's error (`Error::Input`, `Middleware`, `Output` or `Panic`).
 
+[docs/runtime.md](docs/runtime.md) shows how a route is split into Tokio
+tasks, where your code runs, and every step a record goes through from
+startup to shutdown.
+
 ## Usage
 
 ```rust
