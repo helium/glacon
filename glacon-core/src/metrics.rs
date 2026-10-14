@@ -16,6 +16,15 @@ pub const BATCH_DURATION: &str = "glacon_batch_processing_seconds";
 pub const MIDDLEWARE_DROPPED: &str = "glacon_middleware_dropped_total";
 /// Records routed to an output.
 pub const OUTPUT_RECORDS: &str = "glacon_output_records_total";
+/// Batches read again because a previous run did not finish them.
+pub const REPLAYED_BATCHES: &str = "glacon_replayed_batches_total";
+/// Deliveries skipped because the output already had the batch (from the
+/// ledger, or its `already_written` hook).
+pub const SKIPPED_DELIVERIES: &str = "glacon_skipped_deliveries_total";
+/// Batches of an input read but not done (updated hourly).
+pub const IN_FLIGHT_BATCHES: &str = "glacon_in_flight_batches";
+/// Done batches removed from the ledger by retention.
+pub const STATE_PRUNED: &str = "glacon_state_pruned_total";
 
 pub(crate) fn input_counter(name: &'static str, route: &str, input: &str, n: u64) {
     if n > 0 {
@@ -37,4 +46,15 @@ pub(crate) fn batch_processed(route: &str, input: &str, lag: Duration, took: Dur
         .set(lag.as_secs_f64());
     metrics::histogram!(BATCH_DURATION, "route" => route.to_string(), "input" => input.to_string())
         .record(took);
+}
+
+pub(crate) fn state_pruned(route: &str, n: u64) {
+    if n > 0 {
+        metrics::counter!(STATE_PRUNED, "route" => route.to_string()).increment(n);
+    }
+}
+
+pub(crate) fn in_flight(route: &str, input: &str, n: u64) {
+    metrics::gauge!(IN_FLIGHT_BATCHES, "route" => route.to_string(), "input" => input.to_string())
+        .set(n as f64);
 }

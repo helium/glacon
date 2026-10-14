@@ -1,7 +1,7 @@
 //! The middleware picks outputs per record, or drops it.
 
 use crate::common;
-use glacon_helium::{FileStoreInput, IcebergOutput, MemoryState, Route, metrics as m};
+use glacon_helium::{FileStoreInput, IcebergOutput, Route, metrics as m};
 
 #[tokio::test]
 async fn routes_each_record_to_its_outputs_or_drops_it() -> anyhow::Result<()> {
@@ -21,14 +21,10 @@ async fn routes_each_record_to_its_outputs_or_drops_it() -> anyhow::Result<()> {
     )
     .await?;
 
-    let route = Route::builder("mw_routes")
+    let route = Route::builder("mw_routes", h.route_settings("mw_routes"))
         .input(
             "v1",
-            FileStoreInput::new(
-                common::V1Input,
-                h.input_settings(b, common::start_after()),
-                MemoryState::new(),
-            ),
+            FileStoreInput::new(common::V1Input, h.input_settings(b, common::start_after())),
         )
         .output(
             common::EVENTS,

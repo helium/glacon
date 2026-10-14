@@ -11,20 +11,26 @@
 //! input task ──► processor task (middleware) ──┴──► output task
 //! ```
 //!
-//! Up: outputs, then middlewares, then inputs are initialized, layer by
-//! layer, before any task starts. Down: the TaskManager stops inputs first,
+//! Up: the route opens its ledger (`<state_dir>/state.db`), then outputs,
+//! middlewares and inputs are initialized, layer by layer, before any task
+//! starts. Down: the TaskManager stops inputs first,
 //! then their background tasks, then processors (handling what is queued),
 //! then outputs (writing what is queued, then `terminate`), then their
 //! background tasks.
 
 mod builder;
+mod fresh_state;
+mod settings;
 
 pub use builder::RouteBuilder;
+pub use fresh_state::FreshState;
+pub use settings::RouteSettings;
 
 use crate::{
-    BoxError, GlaconCoreInputInit, GlaconCoreOutputInit, GlaconRecord, InputContext,
+    BoxError, Error, GlaconCoreInputInit, GlaconCoreOutputInit, GlaconRecord, InputContext,
     MiddlewareContext, OutputContext, OutputIndex, Result,
     input::{self, PendingInput, RouteInput},
+    ledger::{InputLedger, Ledger},
     lifecycle::{Initialized, init_all, terminate_all},
     output::{self, PendingOutput, RouteOutput},
     processor::{self, OutputSender, RouteMiddleware},
@@ -52,6 +58,8 @@ struct RouteParts<R> {
     middleware: MiddlewareFactory<R>,
     index: OutputIndex,
     outputs: Vec<(String, Box<dyn GlaconCoreOutputInit<R>>)>,
+    settings: RouteSettings,
+    fresh_state: FreshState,
 }
 
 impl<R: GlaconRecord> Route<R> {
@@ -84,15 +92,21 @@ async fn run<R: GlaconRecord>(
     result.map_err(unwrap_task_error)
 }
 
-/// Initialize every stage, layer by layer, then wire them into the route's
-/// TaskManager. A failed init terminates the layers already initialized.
+/// Open the ledger, initialize every stage, layer by layer, then wire them
+/// into the route's TaskManager. A failed init terminates the layers already
+/// initialized.
 async fn up<R: GlaconRecord>(route: &Arc<str>, parts: RouteParts<R>) -> Result<TaskManager> {
     let RouteParts {
         inputs,
         middleware,
         index,
         outputs,
+        settings,
+        fresh_state,
     } = parts;
+
+    let ledger = Arc::new(Ledger::open(&settings.state_dir).await?);
+    let fresh = ledger.is_fresh().await?;
 
     let outputs = init_all(
         outputs
@@ -107,6 +121,15 @@ async fn up<R: GlaconRecord>(route: &Arc<str>, parts: RouteParts<R>) -> Result<T
             .collect(),
     )
     .await?;
+
+    let with_data = outputs
+        .iter()
+        .find(|(output, _)| output.has_data)
+        .map(|(output, _)| output.ctx.output.clone());
+    if let Err(error) = guard_fresh_state(route, &ledger, fresh, fresh_state, with_data).await {
+        terminate_all(stages(outputs)).await;
+        return Err(error);
+    }
 
     let middlewares = inputs
         .iter()
@@ -139,7 +162,13 @@ async fn up<R: GlaconRecord>(route: &Arc<str>, parts: RouteParts<R>) -> Result<T
             .map(|(name, init)| PendingInput {
                 ctx: InputContext {
                     route: route.clone(),
-                    input: name.into(),
+                    input: name.as_str().into(),
+                    ledger: InputLedger::new(
+                        route.clone(),
+                        name.into(),
+                        ledger.clone(),
+                        settings.processed_retention,
+                    ),
                 },
                 init,
             })
@@ -156,6 +185,37 @@ async fn up<R: GlaconRecord>(route: &Arc<str>, parts: RouteParts<R>) -> Result<T
     };
 
     Ok(wire(route, inputs, middlewares, outputs))
+}
+
+/// With an empty ledger, every input starts over: refuse if an output
+/// (`with_data`) already holds data, unless told to proceed. Then mark the
+/// ledger initialized, so the next start isn't fresh.
+async fn guard_fresh_state(
+    route: &str,
+    ledger: &Ledger,
+    fresh: bool,
+    fresh_state: FreshState,
+    with_data: Option<Arc<str>>,
+) -> Result {
+    if !fresh {
+        return Ok(());
+    }
+    if let Some(name) = with_data {
+        match fresh_state {
+            FreshState::Refuse => {
+                return Err(Error::FreshStateRefused {
+                    route: route.to_string(),
+                    output: name.to_string(),
+                });
+            }
+            FreshState::Proceed => tracing::warn!(
+                route = %route,
+                output = %name,
+                "output already has data but the route's state is empty: proceeding, inputs start over"
+            ),
+        }
+    }
+    ledger.mark_initialized().await
 }
 
 /// The stages, without the background tasks they returned: those are
@@ -213,11 +273,19 @@ fn wire<R: GlaconRecord>(
                 deliveries: deliveries.clone(),
             })
             .collect();
+        let ledger = input.ctx.ledger.clone();
         let name = format!("processor {}", middleware.ctx.input);
         tasks = tasks.add_named(
             name.clone(),
             RouteTask::new(route, name, move |shutdown| {
-                processor::run(middleware, received, wait_for_input, senders, shutdown)
+                processor::run(
+                    middleware,
+                    ledger,
+                    received,
+                    wait_for_input,
+                    senders,
+                    shutdown,
+                )
             }),
         );
         input_tasks.push((input, batches, input_stopped));

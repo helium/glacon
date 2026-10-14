@@ -2,6 +2,4 @@
 
 mod file_store;
 
-pub use self::file_store::{
-    FileMeta, FileStoreInput, GlaconInput, InputSettings, MemoryState, PollerState,
-};
+pub use self::file_store::{FileMeta, FileStoreInput, GlaconInput, InputSettings};

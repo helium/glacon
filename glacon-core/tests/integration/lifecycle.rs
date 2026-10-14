@@ -43,11 +43,13 @@ fn assert_down_order(journal: &Journal) {
 
 #[tokio::test]
 async fn up_initializes_outputs_then_middlewares_then_inputs() -> anyhow::Result<()> {
+    let state = tempfile::tempdir()?;
     let journal = Journal::default();
     let (left, right) = outputs(&journal);
     let inputs = ["a", "b"].map(|name| MemoryInput::new(name, Vec::new(), End::Return, &journal));
 
-    let route = common::route("up", inputs.into(), &left, &right, &journal).build()?;
+    let route =
+        common::route("up", state.path(), inputs.into(), &left, &right, &journal).build()?;
     common::run(route).await?;
 
     journal.assert_before("init output", "init middleware");
@@ -62,6 +64,7 @@ async fn up_initializes_outputs_then_middlewares_then_inputs() -> anyhow::Result
 
 #[tokio::test]
 async fn ends_once_every_input_is_done() -> anyhow::Result<()> {
+    let state = tempfile::tempdir()?;
     let journal = Journal::default();
     let (left, right) = outputs(&journal);
     let inputs = ["a", "b"].map(|name| {
@@ -73,7 +76,8 @@ async fn ends_once_every_input_is_done() -> anyhow::Result<()> {
         )
     });
 
-    let route = common::route("ends", inputs.into(), &left, &right, &journal).build()?;
+    let route =
+        common::route("ends", state.path(), inputs.into(), &left, &right, &journal).build()?;
     common::run(route).await?;
 
     assert_eq!(left.rows(), ["a", "b"]);
@@ -84,6 +88,7 @@ async fn ends_once_every_input_is_done() -> anyhow::Result<()> {
 
 #[tokio::test]
 async fn shutdown_stops_inputs_then_processors_then_outputs() -> anyhow::Result<()> {
+    let state = tempfile::tempdir()?;
     let journal = Journal::default();
     let (left, right) = outputs(&journal);
     let forever = MemoryInput::new(
@@ -96,7 +101,15 @@ async fn shutdown_stops_inputs_then_processors_then_outputs() -> anyhow::Result<
         &journal,
     );
 
-    let route = common::route("shutdown", vec![forever], &left, &right, &journal).build()?;
+    let route = common::route(
+        "shutdown",
+        state.path(),
+        vec![forever],
+        &left,
+        &right,
+        &journal,
+    )
+    .build()?;
     common::run_until(route, left.wait_for_rows(2)).await?;
 
     assert_eq!(left.rows(), ["x", "y"]);
@@ -106,6 +119,7 @@ async fn shutdown_stops_inputs_then_processors_then_outputs() -> anyhow::Result<
 
 #[tokio::test]
 async fn a_failing_input_fails_the_route() -> anyhow::Result<()> {
+    let state = tempfile::tempdir()?;
     let journal = Journal::default();
     let (left, right) = outputs(&journal);
     let healthy = MemoryInput::new("healthy", Vec::new(), End::HoldOpen, &journal);
@@ -116,7 +130,15 @@ async fn a_failing_input_fails_the_route() -> anyhow::Result<()> {
         &journal,
     );
 
-    let route = common::route("inputs", vec![healthy, broken], &left, &right, &journal).build()?;
+    let route = common::route(
+        "inputs",
+        state.path(),
+        vec![healthy, broken],
+        &left,
+        &right,
+        &journal,
+    )
+    .build()?;
     let err = common::run(route).await.expect_err("must fail");
 
     let err = common::route_error(&err);
@@ -133,6 +155,7 @@ async fn a_failing_input_fails_the_route() -> anyhow::Result<()> {
 
 #[tokio::test]
 async fn a_failing_middleware_fails_the_route() -> anyhow::Result<()> {
+    let state = tempfile::tempdir()?;
     let journal = Journal::default();
     let (left, right) = outputs(&journal);
     let input = MemoryInput::new(
@@ -142,7 +165,15 @@ async fn a_failing_middleware_fails_the_route() -> anyhow::Result<()> {
         &journal,
     );
 
-    let route = common::route("middleware", vec![input], &left, &right, &journal).build()?;
+    let route = common::route(
+        "middleware",
+        state.path(),
+        vec![input],
+        &left,
+        &right,
+        &journal,
+    )
+    .build()?;
     let err = common::run(route).await.expect_err("must fail");
 
     let err = common::route_error(&err);
@@ -156,6 +187,7 @@ async fn a_failing_middleware_fails_the_route() -> anyhow::Result<()> {
 
 #[tokio::test]
 async fn a_failing_output_fails_the_route() -> anyhow::Result<()> {
+    let state = tempfile::tempdir()?;
     let journal = Journal::default();
     let (left, right) = outputs(&journal);
     right.fail_writes(1);
@@ -166,7 +198,8 @@ async fn a_failing_output_fails_the_route() -> anyhow::Result<()> {
         &journal,
     );
 
-    let route = common::route("output", vec![input], &left, &right, &journal).build()?;
+    let route =
+        common::route("output", state.path(), vec![input], &left, &right, &journal).build()?;
     let err = common::run(route).await.expect_err("must fail");
 
     let err = common::route_error(&err);
@@ -182,11 +215,13 @@ async fn a_failing_output_fails_the_route() -> anyhow::Result<()> {
 
 #[tokio::test]
 async fn a_panic_fails_the_route() -> anyhow::Result<()> {
+    let state = tempfile::tempdir()?;
     let journal = Journal::default();
     let (left, right) = outputs(&journal);
     let input = MemoryInput::new("panicking", Vec::new(), End::Panic, &journal);
 
-    let route = common::route("panics", vec![input], &left, &right, &journal).build()?;
+    let route =
+        common::route("panics", state.path(), vec![input], &left, &right, &journal).build()?;
     let err = common::run(route).await.expect_err("must fail");
 
     let err = common::route_error(&err);
@@ -202,6 +237,7 @@ async fn a_panic_fails_the_route() -> anyhow::Result<()> {
 
 #[tokio::test]
 async fn a_failed_init_terminates_what_was_initialized() -> anyhow::Result<()> {
+    let state = tempfile::tempdir()?;
     let journal = Journal::default();
     let (left, right) = outputs(&journal);
     let mut broken = MemoryInput::new("broken", Vec::new(), End::Return, &journal);
@@ -209,7 +245,15 @@ async fn a_failed_init_terminates_what_was_initialized() -> anyhow::Result<()> {
     let mut healthy = MemoryInput::new("healthy", Vec::new(), End::Return, &journal);
     healthy.background = Some(BackgroundEnd::UntilStopped);
 
-    let route = common::route("init", vec![healthy, broken], &left, &right, &journal).build()?;
+    let route = common::route(
+        "init",
+        state.path(),
+        vec![healthy, broken],
+        &left,
+        &right,
+        &journal,
+    )
+    .build()?;
     let err = common::run(route).await.expect_err("must fail");
 
     let err = common::route_error(&err);
@@ -232,12 +276,21 @@ async fn a_failed_init_terminates_what_was_initialized() -> anyhow::Result<()> {
 
 #[tokio::test]
 async fn a_failed_output_init_starts_nothing_else() -> anyhow::Result<()> {
+    let state = tempfile::tempdir()?;
     let journal = Journal::default();
     let (mut left, right) = outputs(&journal);
     left.fail_init = true;
     let input = MemoryInput::new("us", Vec::new(), End::Return, &journal);
 
-    let route = common::route("output_init", vec![input], &left, &right, &journal).build()?;
+    let route = common::route(
+        "output_init",
+        state.path(),
+        vec![input],
+        &left,
+        &right,
+        &journal,
+    )
+    .build()?;
     let err = common::run(route).await.expect_err("must fail");
 
     let err = common::route_error(&err);
@@ -253,6 +306,7 @@ async fn a_failed_output_init_starts_nothing_else() -> anyhow::Result<()> {
 
 #[tokio::test]
 async fn a_failing_route_stops_the_others_in_the_task_manager() -> anyhow::Result<()> {
+    let state = tempfile::tempdir()?;
     let journal = Journal::default();
     let healthy_outputs = (
         MemoryOutput::new(common::LEFT, &journal),
@@ -260,6 +314,7 @@ async fn a_failing_route_stops_the_others_in_the_task_manager() -> anyhow::Resul
     );
     let healthy = common::route(
         "healthy",
+        state.path(),
         vec![MemoryInput::new(
             "forever",
             Vec::new(),
@@ -274,6 +329,7 @@ async fn a_failing_route_stops_the_others_in_the_task_manager() -> anyhow::Resul
     let (left, right) = outputs(&Journal::default());
     let failing = common::route(
         "failing",
+        state.path(),
         vec![MemoryInput::new(
             "broken",
             Vec::new(),
@@ -305,6 +361,7 @@ async fn a_failing_route_stops_the_others_in_the_task_manager() -> anyhow::Resul
 
 #[tokio::test]
 async fn background_tasks_stop_after_their_stage() -> anyhow::Result<()> {
+    let state = tempfile::tempdir()?;
     let journal = Journal::default();
     let (mut left, right) = outputs(&journal);
     left.background = Some(BackgroundEnd::UntilStopped);
@@ -316,7 +373,15 @@ async fn background_tasks_stop_after_their_stage() -> anyhow::Result<()> {
     );
     forever.background = Some(BackgroundEnd::UntilStopped);
 
-    let route = common::route("background", vec![forever], &left, &right, &journal).build()?;
+    let route = common::route(
+        "background",
+        state.path(),
+        vec![forever],
+        &left,
+        &right,
+        &journal,
+    )
+    .build()?;
     common::run_until(route, left.wait_for_rows(1)).await?;
 
     assert_down_order(&journal);
@@ -328,6 +393,7 @@ async fn background_tasks_stop_after_their_stage() -> anyhow::Result<()> {
 
 #[tokio::test]
 async fn an_input_ends_when_its_background_task_does() -> anyhow::Result<()> {
+    let state = tempfile::tempdir()?;
     let journal = Journal::default();
     let (left, right) = outputs(&journal);
     let feed = ChannelInput::new(
@@ -339,7 +405,7 @@ async fn an_input_ends_when_its_background_task_does() -> anyhow::Result<()> {
         &journal,
     );
 
-    let route = common::route("channel", Vec::new(), &left, &right, &journal)
+    let route = common::route("channel", state.path(), Vec::new(), &left, &right, &journal)
         .input(feed.name, feed)
         .build()?;
     common::run(route).await?;
@@ -351,6 +417,7 @@ async fn an_input_ends_when_its_background_task_does() -> anyhow::Result<()> {
 
 #[tokio::test]
 async fn a_failing_background_task_fails_the_route() -> anyhow::Result<()> {
+    let state = tempfile::tempdir()?;
     for side in ["input", "output"] {
         let journal = Journal::default();
         let (mut left, right) = outputs(&journal);
@@ -360,7 +427,15 @@ async fn a_failing_background_task_fails_the_route() -> anyhow::Result<()> {
             _ => left.background = Some(BackgroundEnd::Fail),
         }
 
-        let route = common::route("background", vec![input], &left, &right, &journal).build()?;
+        let route = common::route(
+            "background",
+            state.path(),
+            vec![input],
+            &left,
+            &right,
+            &journal,
+        )
+        .build()?;
         let err = common::run(route).await.expect_err("must fail");
 
         let err = common::route_error(&err);
@@ -378,12 +453,21 @@ async fn a_failing_background_task_fails_the_route() -> anyhow::Result<()> {
 
 #[tokio::test]
 async fn a_panicking_background_task_fails_the_route() -> anyhow::Result<()> {
+    let state = tempfile::tempdir()?;
     let journal = Journal::default();
     let (left, right) = outputs(&journal);
     let mut input = MemoryInput::new("us", Vec::new(), End::HoldOpen, &journal);
     input.background = Some(BackgroundEnd::Panic);
 
-    let route = common::route("background", vec![input], &left, &right, &journal).build()?;
+    let route = common::route(
+        "background",
+        state.path(),
+        vec![input],
+        &left,
+        &right,
+        &journal,
+    )
+    .build()?;
     let err = common::run(route).await.expect_err("must fail");
 
     let err = common::route_error(&err);

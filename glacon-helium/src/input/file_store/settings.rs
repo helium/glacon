@@ -15,8 +15,10 @@ pub struct InputSettings {
     #[serde(default, with = "humantime_serde")]
     pub poll_duration: Option<Duration>,
 
-    /// How far before the newest processed file the poller re-lists, to catch
-    /// late uploads (file_store default: 10 minutes).
+    /// How far before its resume point the poller re-lists, to catch late
+    /// uploads (file_store default: 10 minutes). Keep it within the route's
+    /// `processed_retention`: a done file forgotten, then listed again, is
+    /// delivered again.
     #[serde(default, with = "humantime_serde")]
     pub offset: Option<Duration>,
 

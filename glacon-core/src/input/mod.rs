@@ -6,8 +6,9 @@ mod context;
 mod task;
 mod r#trait;
 
-pub use batch::Batch;
+pub use batch::{Batch, BatchId};
 pub use context::InputContext;
 pub use r#trait::{GlaconCoreInput, GlaconCoreInputInit, InitializedInput};
 
+pub(crate) use batch::ReadBatch;
 pub(crate) use task::{PendingInput, RouteInput, run};

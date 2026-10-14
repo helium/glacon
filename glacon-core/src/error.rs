@@ -46,6 +46,22 @@ pub enum Error {
         task: String,
         message: String,
     },
+
+    /// An output already has data but the route's ledger is empty.
+    #[error(
+        "route {route}: output {output} already has data but the route's state is empty; \
+         refusing to start (see FreshState)"
+    )]
+    FreshStateRefused { route: String, output: String },
+
+    #[error("state db: {0}")]
+    State(#[from] sqlx::Error),
+
+    #[error("state db migration: {0}")]
+    Migrate(#[from] sqlx::migrate::MigrateError),
+
+    #[error("io: {0}")]
+    Io(#[from] std::io::Error),
 }
 
 impl Error {

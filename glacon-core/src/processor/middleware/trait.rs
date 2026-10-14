@@ -1,5 +1,5 @@
 use super::{Destination, MiddlewareContext};
-use crate::{BoxError, GlaconRecord};
+use crate::{BatchId, BoxError, GlaconRecord};
 
 /// Decides which outputs, if any, receive each record.
 ///
@@ -13,6 +13,11 @@ use crate::{BoxError, GlaconRecord};
 ///
 /// Deduplication, verification and the like live here: drop a record by
 /// returning [`Destination::Drop`] for it.
+///
+/// After a crash, a batch that was not done is handled again. A middleware
+/// keeping state across batches (seen keys, for example) must be replay
+/// safe: key that state by [`BatchId`], so a record its own batch already
+/// claimed is still routed on a replay.
 #[async_trait::async_trait]
 pub trait GlaconCoreMiddleware<R: GlaconRecord>: Send + 'static {
     async fn init(&mut self, _ctx: &MiddlewareContext) -> Result<(), BoxError> {
@@ -21,7 +26,11 @@ pub trait GlaconCoreMiddleware<R: GlaconRecord>: Send + 'static {
 
     /// Where each record of a batch goes: one [`Destination`] per record, in
     /// the same order.
-    async fn handle_data(&mut self, records: &[R]) -> Result<Vec<Destination>, BoxError>;
+    async fn handle_data(
+        &mut self,
+        batch: &BatchId,
+        records: &[R],
+    ) -> Result<Vec<Destination>, BoxError>;
 
     async fn terminate(&mut self) -> Result<(), BoxError> {
         Ok(())

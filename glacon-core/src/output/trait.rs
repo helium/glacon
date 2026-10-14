@@ -1,5 +1,5 @@
 use super::OutputContext;
-use crate::{BoxError, GlaconRecord};
+use crate::{BatchId, BoxError, GlaconRecord};
 use task_manager::ManagedTask;
 
 /// An output as given to the route: its configuration. The route turns it
@@ -32,6 +32,9 @@ pub struct InitializedOutput<R> {
     pub output: Box<dyn GlaconCoreOutput<R>>,
     /// Background work for the route to supervise.
     pub task: Option<Box<dyn ManagedTask>>,
+    /// The destination already held data. With an empty ledger, the route
+    /// then refuses to start (see [`FreshState`](crate::FreshState)).
+    pub has_data: bool,
 }
 
 impl<R: GlaconRecord> InitializedOutput<R> {
@@ -40,12 +43,19 @@ impl<R: GlaconRecord> InitializedOutput<R> {
         Self {
             output: Box::new(output),
             task: None,
+            has_data: false,
         }
     }
 
     /// With `task` as the background work for the route to supervise.
     pub fn with_task(mut self, task: impl ManagedTask + 'static) -> Self {
         self.task = Some(Box::new(task));
+        self
+    }
+
+    /// Whether the destination already held data (default: no).
+    pub fn with_existing_data(mut self, has_data: bool) -> Self {
+        self.has_data = has_data;
         self
     }
 }
@@ -55,8 +65,18 @@ impl<R: GlaconRecord> InitializedOutput<R> {
 /// terminated once every processor stopped. An error stops the route.
 #[async_trait::async_trait]
 pub trait GlaconCoreOutput<R: GlaconRecord>: Send + 'static {
-    /// Write the records of one batch routed to this output.
-    async fn handle_data(&mut self, records: &[&R]) -> Result<(), BoxError>;
+    /// Write the records of one batch routed to this output. Return only
+    /// once they are durable: returning `Ok` is the acknowledgement, after
+    /// which the route never hands this output the batch again.
+    async fn handle_data(&mut self, batch: &BatchId, records: &[&R]) -> Result<(), BoxError>;
+
+    /// Whether this output already holds `batch`: asked only when a batch is
+    /// read again after a crash, before writing it. An output that can tell
+    /// (an idempotent key, a transactional sink) avoids writing it twice when
+    /// the process died right after its write. Default: no.
+    async fn already_written(&mut self, _batch: &BatchId) -> Result<bool, BoxError> {
+        Ok(false)
+    }
 
     /// Flush what is buffered. Called once the output's task received its
     /// last batch, also after an error, and before its background task (if

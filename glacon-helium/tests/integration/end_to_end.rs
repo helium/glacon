@@ -2,7 +2,7 @@
 //! N -> M, and several routes in one TaskManager.
 
 use crate::common;
-use glacon_helium::{FileStoreInput, IcebergOutput, MemoryState, Route, task_manager::TaskManager};
+use glacon_helium::{FileStoreInput, IcebergOutput, Route, task_manager::TaskManager};
 use glacon_test_proto::event_v2::Kind as V2Kind;
 
 #[tokio::test]
@@ -19,14 +19,10 @@ async fn one_input_to_one_output() -> anyhow::Result<()> {
         .await?;
     }
 
-    let route = Route::builder("events")
+    let route = Route::builder("events", h.route_settings("events"))
         .input(
             "v1",
-            FileStoreInput::new(
-                common::V1Input,
-                h.input_settings(b, common::start_after()),
-                MemoryState::new(),
-            ),
+            FileStoreInput::new(common::V1Input, h.input_settings(b, common::start_after())),
         )
         .output(
             common::EVENTS,
@@ -63,22 +59,14 @@ async fn fan_in_from_inputs_with_different_protos() -> anyhow::Result<()> {
     )
     .await?;
 
-    let route = Route::builder("events")
+    let route = Route::builder("events", h.route_settings("events"))
         .input(
             "v1",
-            FileStoreInput::new(
-                common::V1Input,
-                h.input_settings(b1, common::start_after()),
-                MemoryState::new(),
-            ),
+            FileStoreInput::new(common::V1Input, h.input_settings(b1, common::start_after())),
         )
         .input(
             "v2",
-            FileStoreInput::new(
-                common::V2Input,
-                h.input_settings(b2, common::start_after()),
-                MemoryState::new(),
-            ),
+            FileStoreInput::new(common::V2Input, h.input_settings(b2, common::start_after())),
         )
         .output(
             common::EVENTS,
@@ -112,14 +100,10 @@ async fn fan_out_to_outputs_with_different_rows() -> anyhow::Result<()> {
     )
     .await?;
 
-    let route = Route::builder("events")
+    let route = Route::builder("events", h.route_settings("events"))
         .input(
             "v2",
-            FileStoreInput::new(
-                common::V2Input,
-                h.input_settings(b, common::start_after()),
-                MemoryState::new(),
-            ),
+            FileStoreInput::new(common::V2Input, h.input_settings(b, common::start_after())),
         )
         .output(
             common::EVENTS,
@@ -188,24 +172,14 @@ async fn fan_in_and_fan_out_from_n_inputs_to_m_outputs() -> anyhow::Result<()> {
         .await?;
 
     // Default middleware: every record of every input goes to every output.
-    // Both inputs share one poller state, each under its own name.
-    let state = MemoryState::new();
-    let route = Route::builder("n_to_m")
+    let route = Route::builder("n_to_m", h.route_settings("n_to_m"))
         .input(
             "v1",
-            FileStoreInput::new(
-                common::V1Input,
-                h.input_settings(b1, common::start_after()),
-                state.clone(),
-            ),
+            FileStoreInput::new(common::V1Input, h.input_settings(b1, common::start_after())),
         )
         .input(
             "v2",
-            FileStoreInput::new(
-                common::V2Input,
-                h.input_settings(b2, common::start_after()),
-                state.clone(),
-            ),
+            FileStoreInput::new(common::V2Input, h.input_settings(b2, common::start_after())),
         )
         .output(
             common::EVENTS,
@@ -254,12 +228,13 @@ async fn fan_in_and_fan_out_from_n_inputs_to_m_outputs() -> anyhow::Result<()> {
     .collect();
     assert_eq!(got, expected);
 
-    // Each input's files are recorded under that input.
+    // Each input's files are done under that input.
+    let ledger = h.ledger("n_to_m").await?;
     for file in &v1_files {
-        assert!(state.contains("v1", file));
-        assert!(!state.contains("v2", file));
+        assert!(ledger.is_done("v1", file).await?);
+        assert!(!ledger.is_done("v2", file).await?);
     }
-    assert!(state.contains("v2", &v2_file));
+    assert!(ledger.is_done("v2", &v2_file).await?);
 
     h.cleanup().await?;
     Ok(())
@@ -284,28 +259,20 @@ async fn several_routes_run_side_by_side() -> anyhow::Result<()> {
     )
     .await?;
 
-    let first = Route::builder("first")
+    let first = Route::builder("first", h.route_settings("first"))
         .input(
             "v1",
-            FileStoreInput::new(
-                common::V1Input,
-                h.input_settings(b, common::start_after()),
-                MemoryState::new(),
-            ),
+            FileStoreInput::new(common::V1Input, h.input_settings(b, common::start_after())),
         )
         .output(
             common::EVENTS,
             IcebergOutput::new(common::EventsTable("first_events"), h.output_settings()),
         )
         .build()?;
-    let second = Route::builder("second")
+    let second = Route::builder("second", h.route_settings("second"))
         .input(
             "v2",
-            FileStoreInput::new(
-                common::V2Input,
-                h.input_settings(b, common::start_after()),
-                MemoryState::new(),
-            ),
+            FileStoreInput::new(common::V2Input, h.input_settings(b, common::start_after())),
         )
         .output(
             common::EVENTS,

@@ -1,14 +1,23 @@
 use super::middleware::{Destination, GlaconCoreMiddleware, MiddlewareContext, OutputId};
 use crate::{
-    Batch, Error, GlaconRecord, Result,
+    Error, GlaconRecord, Result,
+    input::ReadBatch,
+    ledger::InputLedger,
     lifecycle::{Initialized, Lifecycle, Terminate},
     metrics,
-    output::Delivery,
+    output::{BatchTicket, Delivery},
 };
 use chrono::Utc;
 use futures::future;
-use std::{sync::Arc, time::Instant};
+use std::{
+    sync::Arc,
+    time::{Duration, Instant},
+};
 use tokio::sync::{mpsc, oneshot};
+
+/// How often a processor forgets its input's expired batches and reports
+/// those in flight.
+const HOUSEKEEPING_EVERY: Duration = Duration::from_secs(60 * 60);
 
 /// An input's middleware with its context, the same before and after
 /// `init`.
@@ -52,16 +61,28 @@ pub(crate) struct OutputSender<R> {
 /// (or, on shutdown, until what is queued is handled), then terminate the
 /// middleware.
 ///
+/// A batch is handed only to the outputs that don't have it yet (on a
+/// replay, the ledger knows which do). A batch no output gets is done right
+/// away; otherwise the last output to take it marks it done.
+///
 /// If the middleware fails or an output is gone, the input is stopped first:
 /// the middleware terminates only once its input did.
 pub(crate) async fn run<R: GlaconRecord>(
     mut route_middleware: RouteMiddleware<R>,
-    mut batches: mpsc::Receiver<Batch<R>>,
+    ledger: InputLedger,
+    mut batches: mpsc::Receiver<ReadBatch<R>>,
     input_stopped: oneshot::Receiver<()>,
     outputs: Vec<OutputSender<R>>,
     shutdown: triggered::Listener,
 ) -> Result {
-    let processed = process_all(&mut route_middleware, &mut batches, &outputs, &shutdown).await;
+    let processed = process_all(
+        &mut route_middleware,
+        &ledger,
+        &mut batches,
+        &outputs,
+        &shutdown,
+    )
+    .await;
     // Stops the input if still running (it watches for this; what it left
     // is lost), then waits until it terminated.
     drop(batches);
@@ -75,11 +96,14 @@ pub(crate) async fn run<R: GlaconRecord>(
 
 async fn process_all<R: GlaconRecord>(
     route_middleware: &mut RouteMiddleware<R>,
-    batches: &mut mpsc::Receiver<Batch<R>>,
+    ledger: &InputLedger,
+    batches: &mut mpsc::Receiver<ReadBatch<R>>,
     outputs: &[OutputSender<R>],
     shutdown: &triggered::Listener,
 ) -> Result {
     let mut closed = false;
+    let mut housekeeping = tokio::time::interval(HOUSEKEEPING_EVERY);
+    housekeeping.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     loop {
         let batch = tokio::select! {
             biased;
@@ -87,6 +111,10 @@ async fn process_all<R: GlaconRecord>(
                 Some(batch) => batch,
                 None => return Ok(()),
             },
+            _ = housekeeping.tick() => {
+                housekeep(&route_middleware.ctx, ledger).await;
+                continue;
+            }
             // The input stops first; take what it left, then stop.
             _ = shutdown.clone(), if !closed => {
                 batches.close();
@@ -94,8 +122,24 @@ async fn process_all<R: GlaconRecord>(
                 continue;
             }
         };
-        if !process(route_middleware, batch, outputs).await? {
+        if !process(route_middleware, ledger, batch, outputs).await? {
             return Ok(());
+        }
+    }
+}
+
+/// Forget the input's expired batches and report those in flight. A failure
+/// is only logged: the next batch would hit the same ledger and fail the
+/// route if it is really broken.
+async fn housekeep(ctx: &MiddlewareContext, ledger: &InputLedger) {
+    let MiddlewareContext { route, input } = ctx;
+    if let Err(error) = ledger.prune_expired().await {
+        tracing::warn!(route = %route, input = %input, %error, "failed to prune the ledger");
+    }
+    match ledger.in_flight().await {
+        Ok(n) => metrics::in_flight(route, input, n),
+        Err(error) => {
+            tracing::warn!(route = %route, input = %input, %error, "failed to count batches in flight")
         }
     }
 }
@@ -104,20 +148,21 @@ async fn process_all<R: GlaconRecord>(
 /// the route reports.
 async fn process<R: GlaconRecord>(
     route_middleware: &mut RouteMiddleware<R>,
-    batch: Batch<R>,
+    ledger: &InputLedger,
+    batch: ReadBatch<R>,
     outputs: &[OutputSender<R>],
 ) -> Result<bool> {
     let started = Instant::now();
     let MiddlewareContext { route, input } = &route_middleware.ctx;
-    let Batch {
-        key,
-        timestamp,
+    let ReadBatch {
+        id,
+        replayed,
         records,
     } = batch;
 
     let destinations = route_middleware
         .middleware
-        .handle_data(&records)
+        .handle_data(&id, &records)
         .await
         .map_err(|e| Error::middleware(route, input, e))?;
     if destinations.len() != records.len() {
@@ -131,19 +176,44 @@ async fn process<R: GlaconRecord>(
             ),
         ));
     }
-    let (picks, dropped) = pick(&destinations, outputs.len());
+    let (mut picks, dropped) = pick(&destinations, outputs.len());
     metrics::input_counter(metrics::MIDDLEWARE_DROPPED, route, input, dropped);
 
+    // A replayed batch skips the outputs that already took it.
+    if replayed {
+        let delivered = ledger.deliveries(&id).await?;
+        for (output, picks) in outputs.iter().zip(&mut picks) {
+            if !picks.is_empty() && delivered.contains(&*output.name) {
+                metrics::output_counter(metrics::SKIPPED_DELIVERIES, route, &output.name, 1);
+                picks.clear();
+            }
+        }
+    }
+
+    let targets = picks.iter().filter(|picks| !picks.is_empty()).count();
     let records = Arc::new(records);
+    if targets == 0 {
+        ledger.complete(&id).await?;
+    }
+    let ticket = Arc::new(BatchTicket::new(
+        id.clone(),
+        replayed,
+        ledger.clone(),
+        targets,
+    ));
     let sends = outputs
         .iter()
         .zip(picks)
         .filter(|(_, picks)| !picks.is_empty())
         .map(|(output, picks)| {
-            let records = records.clone();
+            let delivery = Delivery {
+                ticket: ticket.clone(),
+                records: records.clone(),
+                picks,
+            };
             async move {
-                let routed = picks.len() as u64;
-                let sent = output.deliveries.send(Delivery { records, picks }).await;
+                let routed = delivery.picks.len() as u64;
+                let sent = output.deliveries.send(delivery).await;
                 (output, routed, sent.is_ok())
             }
         });
@@ -155,14 +225,16 @@ async fn process<R: GlaconRecord>(
         metrics::output_counter(metrics::OUTPUT_RECORDS, route, &output.name, routed);
     }
 
-    let lag = (Utc::now() - timestamp).to_std().unwrap_or_default();
+    let lag = (Utc::now() - id.timestamp).to_std().unwrap_or_default();
     metrics::batch_processed(route, input, lag, started.elapsed());
     tracing::info!(
         route = %route,
         input = %input,
-        batch = %key,
+        batch = %id.key,
         records = records.len(),
         dropped,
+        outputs = targets,
+        replayed,
         "processed batch"
     );
     Ok(true)

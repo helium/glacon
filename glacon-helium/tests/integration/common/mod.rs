@@ -9,8 +9,8 @@ pub use harness::Harness;
 
 use chrono::{DateTime, Duration, Utc};
 use glacon_helium::{
-    BoxError, Destination, FileMeta, GlaconCoreMiddleware, GlaconInput, GlaconOutput, OutputId,
-    async_trait,
+    BatchId, BoxError, Destination, FileMeta, GlaconCoreMiddleware, GlaconInput, GlaconOutput,
+    OutputId, async_trait,
     helium_iceberg::{FieldDefinition, PartitionDefinition, TableDefinition},
     task_manager::ManagedTask,
 };
@@ -219,7 +219,11 @@ pub struct ByKindMiddleware {
 
 #[async_trait]
 impl GlaconCoreMiddleware<Event> for ByKindMiddleware {
-    async fn handle_data(&mut self, events: &[Event]) -> Result<Vec<Destination>, BoxError> {
+    async fn handle_data(
+        &mut self,
+        _: &BatchId,
+        events: &[Event],
+    ) -> Result<Vec<Destination>, BoxError> {
         Ok(events
             .iter()
             .map(|event| match event.kind {

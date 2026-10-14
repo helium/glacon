@@ -1,4 +1,4 @@
-use super::{Route, RouteParts};
+use super::{FreshState, Route, RouteParts, RouteSettings};
 use crate::{
     AllOutputs, Error, GlaconCoreInputInit, GlaconCoreMiddleware, GlaconCoreOutputInit,
     GlaconRecord, MAX_OUTPUTS, OutputIndex, Result,
@@ -11,12 +11,16 @@ pub(crate) type MiddlewareFactory<R> =
     Box<dyn Fn(&OutputIndex) -> Result<Box<dyn GlaconCoreMiddleware<R>>> + Send>;
 
 impl<R: GlaconRecord> Route<R> {
-    pub fn builder(name: impl Into<String>) -> RouteBuilder<R> {
+    /// Start building a route. `settings.state_dir` holds its ledger: give
+    /// every route its own.
+    pub fn builder(name: impl Into<String>, settings: RouteSettings) -> RouteBuilder<R> {
         RouteBuilder {
             name: name.into(),
             inputs: Vec::new(),
             middleware: None,
             outputs: Vec::new(),
+            settings,
+            fresh_state: FreshState::default(),
         }
     }
 }
@@ -27,7 +31,7 @@ impl<R: GlaconRecord> Route<R> {
 /// [`RouteBuilder::middleware_with`], which looks the outputs up by name:
 ///
 /// ```ignore
-/// let route = Route::builder("speedtests")
+/// let route = Route::builder("speedtests", RouteSettings::new("/data/speedtests"))
 ///     .input("us", us_input)
 ///     .input("eu", eu_input)
 ///     .output("verified", verified_output)
@@ -45,6 +49,8 @@ pub struct RouteBuilder<R> {
     inputs: Vec<(String, Box<dyn GlaconCoreInputInit<R>>)>,
     middleware: Option<MiddlewareFactory<R>>,
     outputs: Vec<(String, Box<dyn GlaconCoreOutputInit<R>>)>,
+    settings: RouteSettings,
+    fresh_state: FreshState,
 }
 
 impl<R: GlaconRecord> RouteBuilder<R> {
@@ -90,6 +96,13 @@ impl<R: GlaconRecord> RouteBuilder<R> {
         self
     }
 
+    /// What to do when the route starts with an empty ledger but an output
+    /// already holds data (default: [`FreshState::Refuse`]).
+    pub fn fresh_state(mut self, fresh_state: FreshState) -> Self {
+        self.fresh_state = fresh_state;
+        self
+    }
+
     /// Validate and build the route.
     pub fn build(self) -> Result<Route<R>> {
         let RouteBuilder {
@@ -97,6 +110,8 @@ impl<R: GlaconRecord> RouteBuilder<R> {
             inputs,
             middleware,
             outputs,
+            settings,
+            fresh_state,
         } = self;
         let middleware = middleware.unwrap_or_else(|| Box::new(|_| Ok(Box::new(AllOutputs))));
         let invalid = |reason: String| Error::invalid_route(&name, reason);
@@ -127,6 +142,8 @@ impl<R: GlaconRecord> RouteBuilder<R> {
                 middleware,
                 index,
                 outputs,
+                settings,
+                fresh_state,
             }),
         })
     }
@@ -160,7 +177,7 @@ fn check_names<'a>(kind: &str, names: impl Iterator<Item = &'a str>) -> Result<(
 mod tests {
     use super::*;
     use crate::{
-        Batch, BoxError, Destination, GlaconCoreInput, GlaconCoreOutput, InitializedInput,
+        Batch, BatchId, BoxError, Destination, GlaconCoreInput, GlaconCoreOutput, InitializedInput,
         InitializedOutput, InputContext, OutputContext, OutputId,
     };
 
@@ -190,7 +207,7 @@ mod tests {
     }
     #[async_trait::async_trait]
     impl GlaconCoreOutput<()> for Out {
-        async fn handle_data(&mut self, _: &[&()]) -> Result<(), BoxError> {
+        async fn handle_data(&mut self, _: &BatchId, _: &[&()]) -> Result<(), BoxError> {
             Ok(())
         }
     }
@@ -199,13 +216,18 @@ mod tests {
     struct Only(OutputId);
     #[async_trait::async_trait]
     impl GlaconCoreMiddleware<()> for Only {
-        async fn handle_data(&mut self, records: &[()]) -> Result<Vec<Destination>, BoxError> {
+        async fn handle_data(
+            &mut self,
+            _: &BatchId,
+            records: &[()],
+        ) -> Result<Vec<Destination>, BoxError> {
             Ok(vec![Destination::Only(self.0.into()); records.len()])
         }
     }
 
     fn test_route_builder() -> RouteBuilder<()> {
-        Route::builder("route")
+        // Never started: the state dir is never created.
+        Route::builder("route", RouteSettings::new("unused"))
     }
 
     fn err(route_builder: RouteBuilder<()>) -> String {
@@ -262,7 +284,9 @@ mod tests {
         let e = err(test_route_builder().input("A/b", In).output("x", Out));
         assert!(e.contains("must match"), "{e}");
 
-        let e = err(Route::builder("").input("a", In).output("x", Out));
+        let e = err(Route::builder("", RouteSettings::new("unused"))
+            .input("a", In)
+            .output("x", Out));
         assert!(e.contains("route name"), "{e}");
     }
 

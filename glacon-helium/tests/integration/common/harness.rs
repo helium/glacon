@@ -1,12 +1,14 @@
 //! Test environment for routes against the docker compose services (RustFS,
 //! Polaris, Trino).
 //!
-//! Each [`Harness`] gets its own Iceberg catalog, its own buckets and its own
-//! spool directories, so tests can run in parallel.
+//! Each [`Harness`] gets its own Iceberg catalog, its own buckets, and its
+//! own spool and state directories, so tests can run in parallel.
 
 use chrono::{DateTime, Utc};
 use file_store::{BucketSettings, aws_local::AwsLocal};
-use glacon_helium::{InputSettings, OutputSettings, file_store, helium_iceberg};
+use glacon_helium::{
+    InputSettings, Ledger, OutputSettings, RouteSettings, file_store, helium_iceberg,
+};
 use helium_iceberg::IcebergTestHarness;
 use std::time::Duration;
 
@@ -20,6 +22,7 @@ pub struct Harness {
     pub iceberg: IcebergTestHarness,
     buckets: Vec<AwsLocal>,
     spool_root: tempfile::TempDir,
+    state_root: tempfile::TempDir,
     /// Test-friendly timings, parsed once.
     poll_duration: Duration,
     idle_timeout: Duration,
@@ -49,6 +52,7 @@ impl Harness {
             iceberg,
             buckets: Vec::new(),
             spool_root: tempfile::tempdir()?,
+            state_root: tempfile::tempdir()?,
             poll_duration: humantime::parse_duration("100ms")?,
             idle_timeout: humantime::parse_duration("2s")?,
             batch_timeout: humantime::parse_duration("1s")?,
@@ -108,6 +112,17 @@ impl Harness {
             max_batch_rows: 10_000,
             batch_timeout: self.batch_timeout,
         }
+    }
+
+    /// Settings of the route `name`: its ledger in its own directory, stable
+    /// for the life of the harness, so the route can be restarted on it.
+    pub fn route_settings(&self, name: &str) -> RouteSettings {
+        RouteSettings::new(self.state_root.path().join(name))
+    }
+
+    /// The ledger of the route `name`, to check what it recorded.
+    pub async fn ledger(&self, name: &str) -> anyhow::Result<Ledger> {
+        Ok(Ledger::open(&self.state_root.path().join(name)).await?)
     }
 
     /// Delete the buckets (required: `AwsLocal` cannot clean up on drop).

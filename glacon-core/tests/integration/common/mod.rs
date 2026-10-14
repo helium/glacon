@@ -1,17 +1,22 @@
 //! In-memory inputs, outputs, middleware and background tasks. A
 //! [`Journal`] shared by everything in a test records every hook call, in
 //! order, so tests can assert on the Up and Down order.
+//!
+//! Stages are fakes, but each route's ledger is a real `state.db` under a
+//! temp dir the test owns: a test restarts a route by building it again on
+//! the same dir.
 
 use chrono::Utc;
 use glacon_core::{
-    Batch, BoxError, Destination, Error, GlaconCoreInput, GlaconCoreInputInit,
+    Batch, BatchId, BoxError, Destination, Error, GlaconCoreInput, GlaconCoreInputInit,
     GlaconCoreMiddleware, GlaconCoreOutput, GlaconCoreOutputInit, InitializedInput,
-    InitializedOutput, InputContext, MiddlewareContext, OutputContext, OutputId, Route,
-    RouteBuilder, async_trait,
+    InitializedOutput, InputContext, Ledger, MiddlewareContext, OutputContext, OutputId, Route,
+    RouteBuilder, RouteSettings, async_trait,
     task_manager::{self, ManagedTask, TaskError, TaskFuture, TaskResult},
 };
 use std::{
     collections::VecDeque,
+    path::Path,
     sync::{
         Arc, Mutex, PoisonError,
         atomic::{AtomicUsize, Ordering},
@@ -320,14 +325,23 @@ impl GlaconCoreInput<Event> for RunningChannelInput {
 
 // ---------------------------------------------------------------- output
 
-/// Keeps the ids it was given. Clones share them, so a test keeps one to
-/// read what the route wrote.
+/// Keeps the ids it was given, and the batches they came in. Clones share
+/// them, so a test keeps one to read what the route wrote, and a restarted
+/// route writes to the same rows. It reports existing data from `init` when
+/// it already has rows.
 #[derive(Clone)]
 pub struct MemoryOutput {
     pub name: &'static str,
     rows: Arc<Mutex<Vec<String>>>,
-    /// Writes left to fail.
+    /// Keys of the batches written, in order.
+    batches: Arc<Mutex<Vec<String>>>,
+    /// Writes left to fail before writing.
     failing_writes: Arc<AtomicUsize>,
+    /// Writes left to fail after writing: a crash right after a durable
+    /// write.
+    failing_after_writes: Arc<AtomicUsize>,
+    /// Answers `already_written` from the batches it wrote.
+    pub knows_written: bool,
     pub fail_init: bool,
     /// Returned from `init` for the route to supervise.
     pub background: Option<BackgroundEnd>,
@@ -339,7 +353,10 @@ impl MemoryOutput {
         Self {
             name,
             rows: Default::default(),
+            batches: Default::default(),
             failing_writes: Default::default(),
+            failing_after_writes: Default::default(),
+            knows_written: false,
             fail_init: false,
             background: None,
             journal: journal.clone(),
@@ -349,6 +366,19 @@ impl MemoryOutput {
     /// Fail the next `n` writes.
     pub fn fail_writes(&self, n: usize) {
         self.failing_writes.store(n, Ordering::SeqCst);
+    }
+
+    /// Write the next `n` batches, then fail.
+    pub fn fail_after_writes(&self, n: usize) {
+        self.failing_after_writes.store(n, Ordering::SeqCst);
+    }
+
+    /// Keys of the batches written, in order (a key twice: written twice).
+    pub fn batches(&self) -> Vec<String> {
+        self.batches
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .clone()
     }
 
     /// Ids written, sorted.
@@ -394,15 +424,19 @@ impl GlaconCoreOutputInit<Event> for MemoryOutput {
                 journal: self.journal.clone(),
             }) as Box<dyn ManagedTask>
         });
-        Ok(InitializedOutput {
-            output: Box::new(RunningMemoryOutput {
-                name: self.name,
-                rows: self.rows.clone(),
-                failing_writes: self.failing_writes.clone(),
-                journal: self.journal.clone(),
-            }),
-            task,
+        let has_data = !self.rows().is_empty();
+        let mut initialized = InitializedOutput::new(RunningMemoryOutput {
+            name: self.name,
+            rows: self.rows.clone(),
+            batches: self.batches.clone(),
+            failing_writes: self.failing_writes.clone(),
+            failing_after_writes: self.failing_after_writes.clone(),
+            knows_written: self.knows_written,
+            journal: self.journal.clone(),
         })
+        .with_existing_data(has_data);
+        initialized.task = task;
+        Ok(initialized)
     }
 }
 
@@ -410,26 +444,47 @@ impl GlaconCoreOutputInit<Event> for MemoryOutput {
 struct RunningMemoryOutput {
     name: &'static str,
     rows: Arc<Mutex<Vec<String>>>,
+    batches: Arc<Mutex<Vec<String>>>,
     failing_writes: Arc<AtomicUsize>,
+    failing_after_writes: Arc<AtomicUsize>,
+    knows_written: bool,
     journal: Journal,
+}
+
+/// Takes one from `n` if not zero yet.
+fn take_one(n: &AtomicUsize) -> bool {
+    n.fetch_update(Ordering::SeqCst, Ordering::SeqCst, |n| n.checked_sub(1))
+        .is_ok()
 }
 
 #[async_trait]
 impl GlaconCoreOutput<Event> for RunningMemoryOutput {
-    async fn handle_data(&mut self, records: &[&Event]) -> Result<(), BoxError> {
-        let fail = self
-            .failing_writes
-            .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |n| n.checked_sub(1))
-            .is_ok();
-        if fail {
+    async fn handle_data(&mut self, batch: &BatchId, records: &[&Event]) -> Result<(), BoxError> {
+        if take_one(&self.failing_writes) {
             return Err(format!("{} write failure", self.name).into());
         }
         self.rows
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
             .extend(records.iter().map(|e| e.id.clone()));
+        self.batches
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .push(batch.key.clone());
         self.journal.push(format!("write {}", self.name));
+        if take_one(&self.failing_after_writes) {
+            return Err(format!("{} failure after write", self.name).into());
+        }
         Ok(())
+    }
+
+    async fn already_written(&mut self, batch: &BatchId) -> Result<bool, BoxError> {
+        let written = self
+            .batches
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .contains(&batch.key);
+        Ok(self.knows_written && written)
     }
 
     async fn terminate(&mut self) -> Result<(), BoxError> {
@@ -457,7 +512,11 @@ impl GlaconCoreMiddleware<Event> for ByKind {
         Ok(())
     }
 
-    async fn handle_data(&mut self, events: &[Event]) -> Result<Vec<Destination>, BoxError> {
+    async fn handle_data(
+        &mut self,
+        _: &BatchId,
+        events: &[Event],
+    ) -> Result<Vec<Destination>, BoxError> {
         events
             .iter()
             .map(|event| match event.kind {
@@ -479,9 +538,21 @@ impl GlaconCoreMiddleware<Event> for ByKind {
 
 // ---------------------------------------------------------------- routes
 
-/// A route over `inputs` writing to `left` and `right` through [`ByKind`].
+/// Settings of the route `name`: its ledger under `state`.
+pub fn settings(state: &Path, name: &str) -> RouteSettings {
+    RouteSettings::new(state.join(name))
+}
+
+/// The ledger of the route `name`, to check what it recorded once it ran.
+pub async fn ledger(state: &Path, name: &str) -> Result<Ledger, Error> {
+    Ledger::open(&state.join(name)).await
+}
+
+/// A route over `inputs` writing to `left` and `right` through [`ByKind`],
+/// its ledger under `state`.
 pub fn route(
     name: &str,
+    state: &Path,
     inputs: Vec<MemoryInput>,
     left: &MemoryOutput,
     right: &MemoryOutput,
@@ -490,9 +561,10 @@ pub fn route(
     let journal = journal.clone();
     inputs
         .into_iter()
-        .fold(Route::builder(name), |builder, input| {
-            builder.input(input.name, input)
-        })
+        .fold(
+            Route::builder(name, settings(state, name)),
+            |builder, input| builder.input(input.name, input),
+        )
         .output(left.name, left.clone())
         .output(right.name, right.clone())
         .middleware_with(move |outputs| {

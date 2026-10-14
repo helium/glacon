@@ -3,7 +3,7 @@
 
 use crate::common;
 use glacon_helium::{
-    FileStoreInput, IcebergOutput, MemoryState, Route, metrics as m,
+    FileStoreInput, IcebergOutput, Route, metrics as m,
     task_manager::{ManagedTask, TaskManager},
 };
 
@@ -25,29 +25,28 @@ async fn shutdown_commits_rows_still_in_the_spool() -> anyhow::Result<()> {
     input.idle_timeout = None;
     let mut output = h.output_settings();
     output.batch_timeout = humantime::parse_duration("1 hour")?;
-    let state = MemoryState::new();
-    let route = Route::builder("shutdown")
-        .input(
-            "v1",
-            FileStoreInput::new(common::V1Input, input, state.clone()),
-        )
+    let route = Route::builder("shutdown", h.route_settings("shutdown"))
+        .input("v1", FileStoreInput::new(common::V1Input, input))
         .output(
             common::EVENTS,
             IcebergOutput::new(common::EventsTable("events"), output),
         )
         .build()?;
 
+    // Opened (created and migrated) before the route opens it too: two
+    // pools racing to create the same state.db can find it locked.
+    let ledger = h.ledger("shutdown").await?;
     let (trigger, shutdown) = triggered::trigger();
     let running = tokio::spawn(Box::new(route).start_task(shutdown));
 
-    // Wait until the file was read (its rows are on their way to the spool).
+    // Wait until the file is done: its rows are in the spool.
     for _ in 0..100 {
-        if state.contains("v1", &key) {
+        if ledger.is_done("v1", &key).await? {
             break;
         }
         tokio::time::sleep(humantime::parse_duration("100ms")?).await;
     }
-    assert!(state.contains("v1", &key));
+    assert!(ledger.is_done("v1", &key).await?);
     assert_eq!(common::count(&h, "events").await?, 0, "not committed yet");
 
     trigger.trigger();
@@ -66,11 +65,8 @@ async fn a_failing_route_stops_every_route() -> anyhow::Result<()> {
     // Healthy and never ending on its own.
     let mut forever = h.input_settings(b, common::start_after());
     forever.idle_timeout = None;
-    let healthy = Route::builder("healthy")
-        .input(
-            "v1",
-            FileStoreInput::new(common::V1Input, forever, MemoryState::new()),
-        )
+    let healthy = Route::builder("healthy", h.route_settings("healthy"))
+        .input("v1", FileStoreInput::new(common::V1Input, forever))
         .output(
             common::EVENTS,
             IcebergOutput::new(common::EventsTable("healthy_events"), h.output_settings()),
@@ -80,11 +76,8 @@ async fn a_failing_route_stops_every_route() -> anyhow::Result<()> {
     // Its bucket does not exist, so its poller fails.
     let mut missing = h.input_settings(b, common::start_after());
     missing.bucket.bucket = "glacon-no-such-bucket".to_string();
-    let broken = Route::builder("broken")
-        .input(
-            "v1",
-            FileStoreInput::new(common::V1Input, missing, MemoryState::new()),
-        )
+    let broken = Route::builder("broken", h.route_settings("broken"))
+        .input("v1", FileStoreInput::new(common::V1Input, missing))
         .output(
             common::EVENTS,
             IcebergOutput::new(common::EventsTable("broken_events"), h.output_settings()),
@@ -119,16 +112,11 @@ async fn a_restart_with_the_same_state_skips_files_already_read() -> anyhow::Res
     )
     .await?;
 
-    let state = MemoryState::new();
     let route = |h: &common::Harness| {
-        Route::builder("restart")
+        Route::builder("restart", h.route_settings("restart"))
             .input(
                 "v1",
-                FileStoreInput::new(
-                    common::V1Input,
-                    h.input_settings(b, common::start_after()),
-                    state.clone(),
-                ),
+                FileStoreInput::new(common::V1Input, h.input_settings(b, common::start_after())),
             )
             .output(
                 common::EVENTS,
@@ -138,7 +126,7 @@ async fn a_restart_with_the_same_state_skips_files_already_read() -> anyhow::Res
     };
     common::run(route(&h)?).await?;
 
-    // Same state: the first file is not read again, only the new one.
+    // Same state dir: the first file is not read again, only the new one.
     h.put_file(
         b,
         common::V1_PREFIX,
@@ -173,14 +161,10 @@ async fn undecodable_messages_are_dropped_and_counted() -> anyhow::Result<()> {
     )
     .await?;
 
-    let route = Route::builder("decode_errors")
+    let route = Route::builder("decode_errors", h.route_settings("decode_errors"))
         .input(
             "v1",
-            FileStoreInput::new(
-                common::V1Input,
-                h.input_settings(b, common::start_after()),
-                MemoryState::new(),
-            ),
+            FileStoreInput::new(common::V1Input, h.input_settings(b, common::start_after())),
         )
         .output(
             common::EVENTS,
@@ -212,14 +196,10 @@ async fn metrics_describe_the_route() -> anyhow::Result<()> {
         .await?;
     }
 
-    let route = Route::builder("metered")
+    let route = Route::builder("metered", h.route_settings("metered"))
         .input(
             "v1",
-            FileStoreInput::new(
-                common::V1Input,
-                h.input_settings(b, common::start_after()),
-                MemoryState::new(),
-            ),
+            FileStoreInput::new(common::V1Input, h.input_settings(b, common::start_after())),
         )
         .output(
             common::EVENTS,

@@ -16,7 +16,6 @@ humantime-serde.workspace = true
 metrics.workspace = true
 prost.workspace = true
 serde.workspace = true
-sqlx.workspace = true
 tokio.workspace = true
 tracing.workspace = true
 

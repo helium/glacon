@@ -2,6 +2,7 @@ use super::{Delivery, GlaconCoreOutput, GlaconCoreOutputInit, InitializedOutput,
 use crate::{
     Error, GlaconRecord, Result,
     lifecycle::{Initialized, Lifecycle, Terminate},
+    metrics,
 };
 use tokio::sync::mpsc;
 
@@ -15,6 +16,8 @@ pub(crate) struct PendingOutput<R> {
 pub(crate) struct RouteOutput<R> {
     pub ctx: OutputContext,
     pub output: Box<dyn GlaconCoreOutput<R>>,
+    /// The destination already held data when initialized.
+    pub has_data: bool,
 }
 
 #[async_trait::async_trait]
@@ -23,11 +26,22 @@ impl<R: GlaconRecord> Lifecycle for PendingOutput<R> {
 
     async fn init(self) -> Result<Initialized<RouteOutput<R>>> {
         let PendingOutput { ctx, init } = self;
-        let InitializedOutput { output, task } = init
+        let InitializedOutput {
+            output,
+            task,
+            has_data,
+        } = init
             .init(&ctx)
             .await
             .map_err(|e| Error::output(&ctx.route, &ctx.output, e))?;
-        Ok((RouteOutput { ctx, output }, task))
+        Ok((
+            RouteOutput {
+                ctx,
+                output,
+                has_data,
+            },
+            task,
+        ))
     }
 }
 
@@ -43,6 +57,9 @@ impl<R: GlaconRecord> Terminate for RouteOutput<R> {
 
 /// The output's task: write every delivery until all processors stopped (or,
 /// on shutdown, until what is queued is written), then terminate the output.
+///
+/// Each written batch is recorded in the ledger as delivered to this output.
+/// A replayed batch the output says it already has is only recorded.
 pub(crate) async fn run<R: GlaconRecord>(
     mut route_output: RouteOutput<R>,
     mut deliveries: mpsc::Receiver<Delivery<R>>,
@@ -76,15 +93,28 @@ async fn write<R: GlaconRecord>(
                 continue;
             }
         };
-        let records: Vec<&R> = delivery
-            .picks
-            .iter()
-            .map(|&i| &delivery.records[i])
-            .collect();
-        route_output
-            .output
-            .handle_data(&records)
-            .await
-            .map_err(|e| Error::output(route, output, e))?;
+        let Delivery {
+            ticket,
+            records,
+            picks,
+        } = delivery;
+        let written = ticket.replayed
+            && route_output
+                .output
+                .already_written(&ticket.id)
+                .await
+                .map_err(|e| Error::output(route, output, e))?;
+        if written {
+            metrics::output_counter(metrics::SKIPPED_DELIVERIES, route, output, 1);
+            tracing::info!(route = %route, output = %output, batch = %ticket.id.key, "already written");
+        } else {
+            let records: Vec<&R> = picks.iter().map(|&i| &records[i]).collect();
+            route_output
+                .output
+                .handle_data(&ticket.id, &records)
+                .await
+                .map_err(|e| Error::output(route, output, e))?;
+        }
+        ticket.delivered(output).await?;
     }
 }
