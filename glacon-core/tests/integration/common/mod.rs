@@ -8,10 +8,10 @@
 
 use chrono::Utc;
 use glacon_core::{
-    Batch, BatchId, BoxError, Destination, Error, GlaconCoreInput, GlaconCoreInputInit,
-    GlaconCoreMiddleware, GlaconCoreOutput, GlaconCoreOutputInit, InitializedInput,
-    InitializedOutput, InputContext, Ledger, MiddlewareContext, OutputContext, OutputId, Route,
-    RouteBuilder, RouteSettings, async_trait,
+    Batch, BatchId, BoxError, Error, GlaconCoreInput, GlaconCoreInputInit, GlaconCoreMiddleware,
+    GlaconCoreOutput, GlaconCoreOutputInit, InitializedInput, InitializedOutput, InputContext,
+    Ledger, MiddlewareContext, OutputContext, Route, RouteBuilder, RouteOutputs, RouteSettings,
+    async_trait,
     task_manager::{self, ManagedTask, TaskError, TaskFuture, TaskResult},
 };
 use std::{
@@ -33,7 +33,8 @@ pub const RIGHT: &str = "right";
 #[derive(Debug, Clone)]
 pub struct Event {
     pub id: String,
-    /// "left", "right", "both", "drop" or "fail" (see [`ByKind`]).
+    /// "left", "right" or "both" (which [`MemoryOutput`]s keep it), "drop"
+    /// or "fail" (see [`Checked`]).
     pub kind: &'static str,
 }
 
@@ -325,15 +326,15 @@ impl GlaconCoreInput<Event> for RunningChannelInput {
 
 // ---------------------------------------------------------------- output
 
-/// Keeps the ids it was given, and the batches they came in. Clones share
-/// them, so a test keeps one to read what the route wrote, and a restarted
-/// route writes to the same rows. It reports existing data from `init` when
-/// it already has rows.
+/// Keeps the ids of the events whose kind is its name or "both", and the
+/// batches it was handed. Clones share them, so a test keeps one to read
+/// what the route wrote, and a restarted route writes to the same rows. It
+/// reports existing data from `init` when it already has rows.
 #[derive(Clone)]
 pub struct MemoryOutput {
     pub name: &'static str,
     rows: Arc<Mutex<Vec<String>>>,
-    /// Keys of the batches written, in order.
+    /// Keys of the batches handed to it, in order.
     batches: Arc<Mutex<Vec<String>>>,
     /// Writes left to fail before writing.
     failing_writes: Arc<AtomicUsize>,
@@ -373,7 +374,8 @@ impl MemoryOutput {
         self.failing_after_writes.store(n, Ordering::SeqCst);
     }
 
-    /// Keys of the batches written, in order (a key twice: written twice).
+    /// Keys of the batches handed to it, in order (a key twice: written
+    /// twice), even those it kept nothing of.
     pub fn batches(&self) -> Vec<String> {
         self.batches
             .lock()
@@ -459,14 +461,19 @@ fn take_one(n: &AtomicUsize) -> bool {
 
 #[async_trait]
 impl GlaconCoreOutput<Event> for RunningMemoryOutput {
-    async fn handle_data(&mut self, batch: &BatchId, records: &[&Event]) -> Result<(), BoxError> {
+    async fn handle_data(&mut self, batch: &BatchId, records: &[Event]) -> Result<(), BoxError> {
         if take_one(&self.failing_writes) {
             return Err(format!("{} write failure", self.name).into());
         }
         self.rows
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
-            .extend(records.iter().map(|e| e.id.clone()));
+            .extend(
+                records
+                    .iter()
+                    .filter(|e| e.kind == self.name || e.kind == "both")
+                    .map(|e| e.id.clone()),
+            );
         self.batches
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
@@ -495,17 +502,15 @@ impl GlaconCoreOutput<Event> for RunningMemoryOutput {
 
 // ---------------------------------------------------------------- middleware
 
-/// left -> left, right -> right, both -> every output, drop -> nowhere,
-/// fail -> error.
-pub struct ByKind {
-    pub left: OutputId,
-    pub right: OutputId,
+/// Drops "drop" events and fails on "fail" ones; the rest pass unchanged.
+#[derive(Clone)]
+pub struct Checked {
     pub input: String,
     pub journal: Journal,
 }
 
 #[async_trait]
-impl GlaconCoreMiddleware<Event> for ByKind {
+impl GlaconCoreMiddleware<Event, Event> for Checked {
     async fn init(&mut self, ctx: &MiddlewareContext) -> Result<(), BoxError> {
         self.input = ctx.input().to_string();
         self.journal.push(format!("init middleware {}", self.input));
@@ -515,18 +520,12 @@ impl GlaconCoreMiddleware<Event> for ByKind {
     async fn handle_data(
         &mut self,
         _: &BatchId,
-        events: &[Event],
-    ) -> Result<Vec<Destination>, BoxError> {
-        events
-            .iter()
-            .map(|event| match event.kind {
-                "left" => Ok(Destination::Only(self.left.into())),
-                "right" => Ok(Destination::Only(self.right.into())),
-                "both" => Ok(Destination::All),
-                "fail" => Err("middleware failure".into()),
-                _ => Ok(Destination::Drop),
-            })
-            .collect()
+        events: Vec<Event>,
+    ) -> Result<Vec<Event>, BoxError> {
+        if events.iter().any(|e| e.kind == "fail") {
+            return Err("middleware failure".into());
+        }
+        Ok(events.into_iter().filter(|e| e.kind != "drop").collect())
     }
 
     async fn terminate(&mut self) -> Result<(), BoxError> {
@@ -548,7 +547,7 @@ pub async fn ledger(state: &Path, name: &str) -> Result<Ledger, Error> {
     Ledger::open(&state.join(name)).await
 }
 
-/// A route over `inputs` writing to `left` and `right` through [`ByKind`],
+/// A route over `inputs` writing to `left` and `right` through [`Checked`],
 /// its ledger under `state`.
 pub fn route(
     name: &str,
@@ -557,24 +556,28 @@ pub fn route(
     left: &MemoryOutput,
     right: &MemoryOutput,
     journal: &Journal,
-) -> RouteBuilder<Event> {
-    let journal = journal.clone();
-    inputs
-        .into_iter()
-        .fold(
-            Route::builder(name, settings(state, name)),
-            |builder, input| builder.input(input.name, input),
-        )
+) -> RouteOutputs<Event, Event> {
+    let builder = inputs.into_iter().fold(
+        Route::builder(name, settings(state, name)),
+        |builder, input| builder.input(input.name, input),
+    );
+    route_from(builder, left, right, journal)
+}
+
+/// The rest of [`route`], for a builder with other inputs.
+pub fn route_from(
+    builder: RouteBuilder<Event>,
+    left: &MemoryOutput,
+    right: &MemoryOutput,
+    journal: &Journal,
+) -> RouteOutputs<Event, Event> {
+    builder
+        .middleware(Checked {
+            input: String::new(),
+            journal: journal.clone(),
+        })
         .output(left.name, left.clone())
         .output(right.name, right.clone())
-        .middleware_with(move |outputs| {
-            Ok(ByKind {
-                left: outputs.id(LEFT)?,
-                right: outputs.id(RIGHT)?,
-                input: String::new(),
-                journal: journal.clone(),
-            })
-        })
 }
 
 /// Run a task (a route, or a TaskManager of routes) until it ends.

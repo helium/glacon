@@ -1,10 +1,10 @@
-//! The middleware picks outputs per record, or drops it.
+//! The middleware drops records; each output keeps the kinds it wants.
 
-use crate::common;
+use crate::common::{self, Kind, Only};
 use glacon_helium::{FileStoreInput, IcebergOutput, Route, metrics as m};
 
 #[tokio::test]
-async fn routes_each_record_to_its_outputs_or_drops_it() -> anyhow::Result<()> {
+async fn outputs_keep_what_they_want_of_what_the_middleware_left() -> anyhow::Result<()> {
     common::metrics::install()?;
     let mut h = common::Harness::new().await?;
     let b = h.add_bucket().await?;
@@ -26,20 +26,21 @@ async fn routes_each_record_to_its_outputs_or_drops_it() -> anyhow::Result<()> {
             "v1",
             FileStoreInput::new(common::V1Input, h.input_settings(b, common::start_after())),
         )
+        .middleware(common::DropKind)
         .output(
             common::EVENTS,
-            IcebergOutput::new(common::EventsTable("events"), h.output_settings()),
+            IcebergOutput::new(
+                Only(common::EventsTable("events"), &[Kind::A, Kind::Both]),
+                h.output_settings(),
+            ),
         )
         .output(
             common::VALUES,
-            IcebergOutput::new(common::ValuesTable("event_values"), h.output_settings()),
+            IcebergOutput::new(
+                Only(common::ValuesTable("event_values"), &[Kind::B, Kind::Both]),
+                h.output_settings(),
+            ),
         )
-        .middleware_with(|outputs| {
-            Ok(common::ByKindMiddleware {
-                events: outputs.id(common::EVENTS)?,
-                values: outputs.id(common::VALUES)?,
-            })
-        })
         .build()?;
 
     common::run(route).await?;
@@ -57,20 +58,21 @@ async fn routes_each_record_to_its_outputs_or_drops_it() -> anyhow::Result<()> {
 
     let route = [("route", "mw_routes")];
     assert_eq!(common::metrics::counter(m::MIDDLEWARE_DROPPED, &route)?, 1);
-    assert_eq!(
-        common::metrics::counter(
-            m::OUTPUT_RECORDS,
-            &[("route", "mw_routes"), ("output", common::EVENTS)]
-        )?,
-        2
-    );
-    assert_eq!(
-        common::metrics::counter(
-            m::OUTPUT_RECORDS,
-            &[("route", "mw_routes"), ("output", common::VALUES)]
-        )?,
-        2
-    );
+    for output in [common::EVENTS, common::VALUES] {
+        let labels = [("route", "mw_routes"), ("output", output)];
+        // Every output is handed what the middleware left...
+        assert_eq!(
+            common::metrics::counter(m::OUTPUT_RECORDS, &labels)?,
+            3,
+            "{output}"
+        );
+        // ...and keeps two of them.
+        assert_eq!(
+            common::metrics::counter(m::OUTPUT_ROWS, &labels)?,
+            2,
+            "{output}"
+        );
+    }
     h.cleanup().await?;
     Ok(())
 }

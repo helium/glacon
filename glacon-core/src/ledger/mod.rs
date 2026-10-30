@@ -101,7 +101,7 @@ impl Ledger {
         })
     }
 
-    /// Whether every output `input`'s batch `key` was routed to has it.
+    /// Whether `input`'s batch `key` is done: every output has it.
     pub async fn is_done(&self, input: &str, key: &str) -> Result<bool> {
         Ok(sqlx::query_scalar(
             "SELECT EXISTS(SELECT 1 FROM batches WHERE input = ? AND batch_key = ? AND status = ?)",

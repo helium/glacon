@@ -14,7 +14,7 @@ pub const BATCH_LAG: &str = "glacon_batch_lag_seconds";
 pub const BATCH_DURATION: &str = "glacon_batch_processing_seconds";
 /// Records the middleware sent nowhere.
 pub const MIDDLEWARE_DROPPED: &str = "glacon_middleware_dropped_total";
-/// Records routed to an output.
+/// Records handed to an output (it may keep fewer).
 pub const OUTPUT_RECORDS: &str = "glacon_output_records_total";
 /// Batches read again because a previous run did not finish them.
 pub const REPLAYED_BATCHES: &str = "glacon_replayed_batches_total";

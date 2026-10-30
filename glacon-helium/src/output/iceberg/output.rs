@@ -98,11 +98,15 @@ where
     R: GlaconRecord,
 {
     /// Turn the records into rows and queue them; returns once they are in
-    /// the spool.
-    async fn handle_data(&mut self, _: &BatchId, records: &[&R]) -> Result<(), BoxError> {
+    /// the spool. Records without rows are the ones this table drops: a
+    /// batch with none at all queues nothing.
+    async fn handle_data(&mut self, _: &BatchId, records: &[R]) -> Result<(), BoxError> {
         let mut rows = Vec::new();
         for record in records {
             self.output.to_rows(record, &mut rows);
+        }
+        if rows.is_empty() {
+            return Ok(());
         }
         let count = rows.len() as u64;
         self.writer.queue_all(rows).await?;

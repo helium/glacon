@@ -16,5 +16,9 @@ pub trait GlaconOutput<R>: Send + Sync + 'static {
     fn table(&self) -> helium_iceberg::Result<helium_iceberg::TableDefinition>;
 
     /// Append the rows for `record`. Zero, one or many rows are all fine.
+    ///
+    /// The output gets every record of every batch: append none for the
+    /// records this table doesn't keep. Decide from the record alone, so a
+    /// replayed batch gives the same rows.
     fn to_rows(&self, record: &R, rows: &mut Vec<Self::Row>);
 }

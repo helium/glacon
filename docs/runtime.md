@@ -38,11 +38,10 @@ your task (e.g. main, calling task_manager.start().await)
   ledger (`state.db`), and sends it to its processor.
 - **The processor task** ([processor/task.rs](../glacon-core/src/processor/task.rs))
   runs the input's own middleware over each batch and sends every output the
-  records routed to it (on a replay, only the outputs that don't have them
-  yet).
+  transformed batch (on a replay, only the outputs that don't have it yet).
 - **The output task** ([output/task.rs](../glacon-core/src/output/task.rs))
-  calls your running output's `handle_data` with those records, then records
-  in the ledger that it has the batch.
+  calls your running output's `handle_data` with those records (it writes
+  the ones it keeps), then records in the ledger that it has the batch.
 - **Background tasks** are what an input's or output's `init` returned: for
   glacon-helium, the `file_store` poller and the `helium_iceberg` writer.
   The route starts and stops them like its own tasks, and fails if they do.
@@ -63,14 +62,14 @@ background task always starts before its stage and stops after it.
 
 | Your code | Task | When |
 |---|---|---|
-| `middleware_with(...)` factory | the caller of `build()`, then the route task | once in `build()` to check output names, then once per input at start |
+| `Clone` of your middleware | route | once per input, at start |
 | `GlaconCoreOutputInit::init` (`IcebergOutput`: `GlaconOutput::table()`), returning the running output and its background task | route | once per output, at start |
 | `GlaconCoreMiddleware::init` | route | once per input, at start |
 | `GlaconCoreInputInit::init`, returning the running input and its background task | route | once per input, at start |
 | `GlaconCoreInput::next_batch` (`FileStoreInput`: `GlaconInput::decode`) | input | per batch (per message for `decode`) |
 | `GlaconCoreMiddleware::handle_data` | processor | per batch |
-| `GlaconCoreOutput::already_written` | output | per replayed batch routed to it |
-| `GlaconCoreOutput::handle_data` (`IcebergOutput`: `GlaconOutput::to_rows`) | output | per batch routed to it (per record for `to_rows`) |
+| `GlaconCoreOutput::already_written` | output | per replayed batch it doesn't have yet |
+| `GlaconCoreOutput::handle_data` (`IcebergOutput`: `GlaconOutput::to_rows`) | output | per batch (per record for `to_rows`) |
 | `serde::Serialize` of your `Row` | writer | when rows are converted to Arrow |
 | `terminate` of middlewares and outputs | its own task | when it stops (the route task when undoing a failed start) |
 
@@ -131,20 +130,20 @@ returned are dropped, and the route fails without starting a task.
 | # | Step | Kind | Task | Code |
 |---|---|---|---|---|
 | 21 | Receive the batch (and hourly: forget expired done batches, report those in flight) | async (channel) | processor `us` | `processor/task.rs` `process_all`, `housekeep` |
-| 22 | `GlaconCoreMiddleware::handle_data(&BatchId, records)` (yours): one `Destination` per record | async | processor `us` | `process` |
-| 23 | Check one destination per record; turn them into each output's positions | sync | processor `us` | `process`, `pick` |
+| 22 | `GlaconCoreMiddleware::handle_data(&BatchId, records)` (yours): the transformed records, without the dropped ones | async | processor `us` | `process` |
+| 23 | Count the records the middleware left out | sync | processor `us` | `process` |
 | 24 | On a replay: leave out the outputs the ledger says already took the batch | async (disk) | processor `us` | `process` |
-| 25 | No output left: mark the batch done. Otherwise send every output its share at once, with one shared ticket counting them (blocks while that output has one queued) | async (disk or channels) | processor → outputs | `process`, `output/delivery.rs` |
+| 25 | No record or no output left: mark the batch done. Otherwise send every output the whole batch at once, with one shared ticket counting them (blocks while that output has one queued) | async (disk or channels) | processor → outputs | `process`, `output/delivery.rs` |
 | 26 | Metrics + "processed batch" log | sync | processor `us` | `process` |
 
-### 6. Output (per batch routed to it)
+### 6. Output (per batch)
 
 | # | Step | Kind | Task | Code |
 |---|---|---|---|---|
-| 27 | Receive the delivery; pick its records from the shared batch | async (channel) | output `lake` | `output/task.rs` `write` |
+| 27 | Receive the delivery: the batch, shared by every output | async (channel) | output `lake` | `output/task.rs` `write` |
 | 28 | On a replay: `already_written(&BatchId)` (yours, optional, default no); yes skips steps 29 and 30 | async | output `lake` | `write` |
-| 29 | `GlaconOutput::to_rows` per record (yours) | sync | output `lake` | `output/iceberg/output.rs` `handle_data` |
-| 30 | `queue_all(rows)`: send to the writer, wait for its "on disk" ack | async (channel + ack) | output → writer | `handle_data` |
+| 29 | `GlaconOutput::to_rows` per record (yours): no rows for the records this table doesn't keep | sync | output `lake` | `output/iceberg/output.rs` `handle_data` |
+| 30 | `queue_all(rows)`: send to the writer, wait for its "on disk" ack (skipped when no rows) | async (channel + ack) | output → writer | `handle_data` |
 | 31 | Record in the ledger that `lake` has the batch, then count down the ticket; the last output marks it done (deliveries cleared, one transaction) | async (disk) | output `lake` | `BatchTicket::delivered` |
 
 ### 7. Writer (per message, and per commit)
@@ -186,7 +185,7 @@ and each writer sees its output's handle dropped.
   19 (a batch is `in_flight`) and step 31 (an output has it, then it is
   done), read at steps 6 and 13 (where to resume, which files are done) and
   24 (which outputs a replay skips). It holds no records.
-- **A file is done** once every output it was routed to has it (step 31),
+- **A file is done** once every output has it (step 31),
   that is once its rows are in each writer's spool (step 35). A crash before
   that reads it again on the next run, and delivers it only to the outputs
   that don't have it. The only duplicate glacon allows: a crash between steps

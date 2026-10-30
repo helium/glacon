@@ -60,15 +60,21 @@ impl<R: GlaconRecord> InitializedOutput<R> {
     }
 }
 
-/// A running output: writes the records routed to it (a table, a topic,
-/// ...). Driven by the output's task for every batch routed to it, then
-/// terminated once every processor stopped. An error stops the route.
+/// A running output: writes records somewhere (a table, a topic, ...).
+/// Driven by the output's task for every batch, then terminated once every
+/// processor stopped. An error stops the route.
+///
+/// An output gets every record of every batch, as the middleware left them,
+/// and keeps what it wants: deciding which records to drop is its job. That
+/// decision must depend on the record alone, so a replayed batch gives the
+/// same result.
 #[async_trait::async_trait]
 pub trait GlaconCoreOutput<R: GlaconRecord>: Send + 'static {
-    /// Write the records of one batch routed to this output. Return only
-    /// once they are durable: returning `Ok` is the acknowledgement, after
-    /// which the route never hands this output the batch again.
-    async fn handle_data(&mut self, batch: &BatchId, records: &[&R]) -> Result<(), BoxError>;
+    /// Write the records of one batch this output keeps (possibly none).
+    /// Return only once they are durable: returning `Ok` is the
+    /// acknowledgement, after which the route never hands this output the
+    /// batch again. An output keeping nothing of a batch still returns `Ok`.
+    async fn handle_data(&mut self, batch: &BatchId, records: &[R]) -> Result<(), BoxError>;
 
     /// Whether this output already holds `batch`: asked only when a batch is
     /// read again after a crash, before writing it. An output that can tell

@@ -45,8 +45,8 @@ impl InputLedger {
         self.ledger.resume_point(&self.input).await
     }
 
-    /// Whether the batch `key` is done: every output it was routed to has
-    /// it. A batch read but not done must be produced again.
+    /// Whether the batch `key` is done: every output has it. A batch read
+    /// but not done must be produced again.
     pub async fn is_done(&self, key: &str) -> Result<bool> {
         self.ledger.is_done(&self.input, key).await
     }

@@ -4,12 +4,10 @@ use std::sync::{
     atomic::{AtomicUsize, Ordering},
 };
 
-/// The records of one batch an output gets: the batch is shared by every
-/// output, `picks` are the positions routed to this one.
+/// One batch handed to an output: its records, shared by every output.
 pub(crate) struct Delivery<R> {
     pub ticket: Arc<BatchTicket>,
     pub records: Arc<Vec<R>>,
-    pub picks: Vec<usize>,
 }
 
 /// One batch on its way to its outputs, shared by their deliveries. Each

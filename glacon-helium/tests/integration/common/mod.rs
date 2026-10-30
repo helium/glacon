@@ -9,8 +9,7 @@ pub use harness::Harness;
 
 use chrono::{DateTime, Duration, Utc};
 use glacon_helium::{
-    BatchId, BoxError, Destination, FileMeta, GlaconCoreMiddleware, GlaconInput, GlaconOutput,
-    OutputId, async_trait,
+    BatchId, BoxError, FileMeta, GlaconCoreMiddleware, GlaconInput, GlaconOutput, async_trait,
     helium_iceberg::{FieldDefinition, PartitionDefinition, TableDefinition},
     task_manager::ManagedTask,
 };
@@ -208,30 +207,40 @@ impl GlaconOutput<Event> for ValuesTable {
     }
 }
 
-// ---------------------------------------------------------------- middleware
+/// A table keeping only the events of some kinds: `Only(EventsTable("t"),
+/// &[Kind::A, Kind::Both])`.
+pub struct Only<T>(pub T, pub &'static [Kind]);
 
-/// a -> events, b -> values, both -> every output, drop -> nowhere. Built
-/// with the ids of those two outputs, looked up by name.
-pub struct ByKindMiddleware {
-    pub events: OutputId,
-    pub values: OutputId,
+impl<T: GlaconOutput<Event>> GlaconOutput<Event> for Only<T> {
+    type Row = T::Row;
+
+    fn table(&self) -> glacon_helium::helium_iceberg::Result<TableDefinition> {
+        self.0.table()
+    }
+
+    fn to_rows(&self, event: &Event, rows: &mut Vec<T::Row>) {
+        if self.1.contains(&event.kind) {
+            self.0.to_rows(event, rows);
+        }
+    }
 }
 
+// ---------------------------------------------------------------- middleware
+
+/// Drops "drop" events (no output gets them); the rest pass unchanged.
+#[derive(Clone)]
+pub struct DropKind;
+
 #[async_trait]
-impl GlaconCoreMiddleware<Event> for ByKindMiddleware {
+impl GlaconCoreMiddleware<Event, Event> for DropKind {
     async fn handle_data(
         &mut self,
         _: &BatchId,
-        events: &[Event],
-    ) -> Result<Vec<Destination>, BoxError> {
+        events: Vec<Event>,
+    ) -> Result<Vec<Event>, BoxError> {
         Ok(events
-            .iter()
-            .map(|event| match event.kind {
-                Kind::A => Destination::Only(self.events.into()),
-                Kind::B => Destination::Only(self.values.into()),
-                Kind::Both => Destination::All,
-                Kind::Drop => Destination::Drop,
-            })
+            .into_iter()
+            .filter(|e| e.kind != Kind::Drop)
             .collect())
     }
 }

@@ -1,5 +1,5 @@
-//! A route: one record type read from N inputs, run through a middleware and
-//! written to M outputs.
+//! A route: records read from N inputs, transformed by a middleware and
+//! handed to M outputs, each keeping what it wants.
 //!
 //! A [`Route`] is an oracles `ManagedTask`: run it in your app's
 //! `TaskManager`. It runs its own TaskManager, one task per stage, joined by
@@ -22,13 +22,13 @@ mod builder;
 mod fresh_state;
 mod settings;
 
-pub use builder::RouteBuilder;
+pub use builder::{RouteBuilder, RouteOutputs};
 pub use fresh_state::FreshState;
 pub use settings::RouteSettings;
 
 use crate::{
     BoxError, Error, GlaconCoreInputInit, GlaconCoreOutputInit, GlaconRecord, InputContext,
-    MiddlewareContext, OutputContext, OutputIndex, Result,
+    MiddlewareContext, OutputContext, Result,
     input::{self, PendingInput, RouteInput},
     ledger::{InputLedger, Ledger},
     lifecycle::{Initialized, init_all, terminate_all},
@@ -45,30 +45,31 @@ use tokio::sync::{mpsc, oneshot};
 /// stage upstream waits beyond that.
 const CHANNEL_CAPACITY: usize = 1;
 
-/// A validated route, ready to run as a task.
-pub struct Route<R> {
+/// A validated route, ready to run as a task. Its inputs produce `In`
+/// records, which its middleware turns into the `Out` records its outputs
+/// get (the same type without a middleware).
+pub struct Route<In, Out = In> {
     name: Arc<str>,
     /// Taken once, when the route starts. Behind a mutex because
     /// `ManagedTask` requires `Sync` and stages only need `Send`.
-    parts: Mutex<RouteParts<R>>,
+    parts: Mutex<RouteParts<In, Out>>,
 }
 
-struct RouteParts<R> {
-    inputs: Vec<(String, Box<dyn GlaconCoreInputInit<R>>)>,
-    middleware: MiddlewareFactory<R>,
-    index: OutputIndex,
-    outputs: Vec<(String, Box<dyn GlaconCoreOutputInit<R>>)>,
+struct RouteParts<In, Out> {
+    inputs: Vec<(String, Box<dyn GlaconCoreInputInit<In>>)>,
+    middleware: MiddlewareFactory<In, Out>,
+    outputs: Vec<(String, Box<dyn GlaconCoreOutputInit<Out>>)>,
     settings: RouteSettings,
     fresh_state: FreshState,
 }
 
-impl<R: GlaconRecord> Route<R> {
+impl<In: GlaconRecord, Out: GlaconRecord> Route<In, Out> {
     pub fn name(&self) -> &str {
         &self.name
     }
 }
 
-impl<R: GlaconRecord> ManagedTask for Route<R> {
+impl<In: GlaconRecord, Out: GlaconRecord> ManagedTask for Route<In, Out> {
     fn start_task(self: Box<Self>, shutdown: triggered::Listener) -> TaskFuture {
         let Route { name, parts } = *self;
         let parts = parts.into_inner().unwrap_or_else(PoisonError::into_inner);
@@ -76,9 +77,9 @@ impl<R: GlaconRecord> ManagedTask for Route<R> {
     }
 }
 
-async fn run<R: GlaconRecord>(
+async fn run<In: GlaconRecord, Out: GlaconRecord>(
     route: Arc<str>,
-    parts: RouteParts<R>,
+    parts: RouteParts<In, Out>,
     shutdown: triggered::Listener,
 ) -> Result<(), BoxError> {
     let tasks = up(&route, parts).await?;
@@ -95,11 +96,13 @@ async fn run<R: GlaconRecord>(
 /// Open the ledger, initialize every stage, layer by layer, then wire them
 /// into the route's TaskManager. A failed init terminates the layers already
 /// initialized.
-async fn up<R: GlaconRecord>(route: &Arc<str>, parts: RouteParts<R>) -> Result<TaskManager> {
+async fn up<In: GlaconRecord, Out: GlaconRecord>(
+    route: &Arc<str>,
+    parts: RouteParts<In, Out>,
+) -> Result<TaskManager> {
     let RouteParts {
         inputs,
         middleware,
-        index,
         outputs,
         settings,
         fresh_state,
@@ -133,22 +136,16 @@ async fn up<R: GlaconRecord>(route: &Arc<str>, parts: RouteParts<R>) -> Result<T
 
     let middlewares = inputs
         .iter()
-        .map(|(name, _)| {
-            Ok(RouteMiddleware {
-                ctx: MiddlewareContext {
-                    route: route.clone(),
-                    input: name.as_str().into(),
-                },
-                middleware: middleware(&index)?,
-            })
+        .map(|(name, _)| RouteMiddleware {
+            ctx: MiddlewareContext {
+                route: route.clone(),
+                input: name.as_str().into(),
+            },
+            middleware: middleware(),
         })
-        .collect::<Result<Vec<_>>>();
-    let middlewares = match middlewares {
-        Ok(middlewares) => init_all(middlewares).await,
-        Err(error) => Err(error),
-    };
+        .collect();
     // Middlewares have no background task.
-    let middlewares: Vec<_> = match middlewares {
+    let middlewares: Vec<_> = match init_all(middlewares).await {
         Ok(middlewares) => middlewares.into_iter().map(|(m, _)| m).collect(),
         Err(error) => {
             terminate_all(stages(outputs)).await;
@@ -232,11 +229,11 @@ fn stages<S>(started: Vec<Initialized<S>>) -> Vec<S> {
 /// ```
 ///
 /// so a background task starts before its stage and stops after it.
-fn wire<R: GlaconRecord>(
+fn wire<In: GlaconRecord, Out: GlaconRecord>(
     route: &Arc<str>,
-    inputs: Vec<Initialized<RouteInput<R>>>,
-    middlewares: Vec<RouteMiddleware<R>>,
-    outputs: Vec<Initialized<RouteOutput<R>>>,
+    inputs: Vec<Initialized<RouteInput<In>>>,
+    middlewares: Vec<RouteMiddleware<In, Out>>,
+    outputs: Vec<Initialized<RouteOutput<Out>>>,
 ) -> TaskManager {
     let mut tasks = TaskManager::builder();
 

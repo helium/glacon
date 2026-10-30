@@ -1,98 +1,55 @@
 use super::{FreshState, Route, RouteParts, RouteSettings};
 use crate::{
-    AllOutputs, Error, GlaconCoreInputInit, GlaconCoreMiddleware, GlaconCoreOutputInit,
-    GlaconRecord, MAX_OUTPUTS, OutputIndex, Result,
+    Error, GlaconCoreInputInit, GlaconCoreMiddleware, GlaconCoreOutputInit, GlaconRecord,
+    Passthrough, Result,
 };
 use std::{collections::HashSet, sync::Mutex};
 
-/// Creates a middleware once the route's outputs are known: once to validate
-/// the route, then once per input's processor.
-pub(crate) type MiddlewareFactory<R> =
-    Box<dyn Fn(&OutputIndex) -> Result<Box<dyn GlaconCoreMiddleware<R>>> + Send>;
+/// Creates the middleware of each input's processor.
+pub(crate) type MiddlewareFactory<In, Out> =
+    Box<dyn Fn() -> Box<dyn GlaconCoreMiddleware<In, Out>> + Send>;
 
-impl<R: GlaconRecord> Route<R> {
+impl<In: GlaconRecord> Route<In> {
     /// Start building a route. `settings.state_dir` holds its ledger: give
     /// every route its own.
-    pub fn builder(name: impl Into<String>, settings: RouteSettings) -> RouteBuilder<R> {
+    pub fn builder(name: impl Into<String>, settings: RouteSettings) -> RouteBuilder<In> {
         RouteBuilder {
             name: name.into(),
             inputs: Vec::new(),
-            middleware: None,
-            outputs: Vec::new(),
             settings,
             fresh_state: FreshState::default(),
         }
     }
 }
 
-/// Builds a [`Route`]; [`RouteBuilder::build`] validates it.
-///
-/// Every method takes the builder and returns it, so calls chain. A middleware that selects outputs is created with
-/// [`RouteBuilder::middleware_with`], which looks the outputs up by name:
+/// Builds a [`Route`], in the order data flows: inputs, then optionally the
+/// middleware, then outputs. Adding the middleware or the first output turns
+/// it into a [`RouteOutputs`], which takes outputs and builds the route.
 ///
 /// ```ignore
 /// let route = Route::builder("speedtests", RouteSettings::new("/data/speedtests"))
-///     .input("us", us_input)
+///     .input("us", us_input)                   // produce SpeedTest
 ///     .input("eu", eu_input)
-///     .output("verified", verified_output)
+///     .middleware(VerifySpeedTest::default())  // SpeedTest -> VerifiedSpeedTest
+///     .output("verified", verified_output)     // get VerifiedSpeedTest
 ///     .output("dropped", dropped_output)
-///     .middleware_with(|outputs| {
-///         Ok(VerifySpeedTest {
-///             verified: outputs.id("verified")?,
-///             dropped: outputs.id("dropped")?,
-///         })
-///     })
 ///     .build()?;
 /// ```
-pub struct RouteBuilder<R> {
+///
+/// Without a middleware, outputs get the inputs' records unchanged
+/// ([`Passthrough`]).
+pub struct RouteBuilder<In> {
     name: String,
-    inputs: Vec<(String, Box<dyn GlaconCoreInputInit<R>>)>,
-    middleware: Option<MiddlewareFactory<R>>,
-    outputs: Vec<(String, Box<dyn GlaconCoreOutputInit<R>>)>,
+    inputs: Vec<(String, Box<dyn GlaconCoreInputInit<In>>)>,
     settings: RouteSettings,
     fresh_state: FreshState,
 }
 
-impl<R: GlaconRecord> RouteBuilder<R> {
+impl<In: GlaconRecord> RouteBuilder<In> {
     /// Add an input. `name` identifies it in logs and metrics, and to the
     /// input itself through its context, so keep it stable.
-    pub fn input(mut self, name: impl Into<String>, input: impl GlaconCoreInputInit<R>) -> Self {
+    pub fn input(mut self, name: impl Into<String>, input: impl GlaconCoreInputInit<In>) -> Self {
         self.inputs.push((name.into(), Box::new(input)));
-        self
-    }
-
-    /// Add an output. `name` identifies it to the middleware (see
-    /// [`RouteBuilder::middleware_with`]), in logs and metrics, so keep it
-    /// stable.
-    pub fn output(mut self, name: impl Into<String>, output: impl GlaconCoreOutputInit<R>) -> Self {
-        self.outputs.push((name.into(), Box::new(output)));
-        self
-    }
-
-    /// Set a middleware that needs no output ids, cloned for each input's
-    /// processor (default: [`AllOutputs`]). A route has one middleware:
-    /// setting it again replaces it.
-    pub fn middleware<M>(mut self, middleware: M) -> Self
-    where
-        M: GlaconCoreMiddleware<R> + Clone,
-    {
-        self.middleware = Some(Box::new(move |_| Ok(Box::new(middleware.clone()))));
-        self
-    }
-
-    /// Set a middleware built from the route's outputs: `factory` looks them
-    /// up with [`OutputIndex::id`]. It runs once during
-    /// [`RouteBuilder::build`], where an unknown output name fails the build,
-    /// then once per input when the route starts: every processor owns its
-    /// middleware. A route has one middleware: setting it again replaces it.
-    pub fn middleware_with<M, F>(mut self, factory: F) -> Self
-    where
-        M: GlaconCoreMiddleware<R>,
-        F: Fn(&OutputIndex) -> Result<M> + Send + 'static,
-    {
-        self.middleware = Some(Box::new(move |outputs| {
-            Ok(Box::new(factory(outputs)?) as Box<dyn GlaconCoreMiddleware<R>>)
-        }));
         self
     }
 
@@ -103,17 +60,73 @@ impl<R: GlaconRecord> RouteBuilder<R> {
         self
     }
 
+    /// Set the route's middleware, turning the inputs' `In` records into the
+    /// `Out` records outputs get. It is cloned for each input's processor:
+    /// share state between the clones through an `Arc`, and create what
+    /// can't be cloned (a connection) in its `init`.
+    pub fn middleware<Out, M>(self, middleware: M) -> RouteOutputs<In, Out>
+    where
+        Out: GlaconRecord,
+        M: GlaconCoreMiddleware<In, Out> + Clone,
+    {
+        RouteOutputs {
+            route: self,
+            middleware: Box::new(move || Box::new(middleware.clone())),
+            outputs: Vec::new(),
+        }
+    }
+
+    /// Add the first output of a route without a middleware: outputs get the
+    /// inputs' records unchanged.
+    pub fn output(
+        self,
+        name: impl Into<String>,
+        output: impl GlaconCoreOutputInit<In>,
+    ) -> RouteOutputs<In, In> {
+        self.middleware(Passthrough).output(name, output)
+    }
+}
+
+/// A [`RouteBuilder`] once its middleware is set: takes the outputs, then
+/// [`RouteOutputs::build`] validates the route.
+pub struct RouteOutputs<In, Out> {
+    route: RouteBuilder<In>,
+    middleware: MiddlewareFactory<In, Out>,
+    outputs: Vec<(String, Box<dyn GlaconCoreOutputInit<Out>>)>,
+}
+
+impl<In: GlaconRecord, Out: GlaconRecord> RouteOutputs<In, Out> {
+    /// Add an output. It gets every record of every batch, and keeps what it
+    /// wants. `name` identifies it in logs and metrics, and in the ledger, so
+    /// keep it stable.
+    pub fn output(
+        mut self,
+        name: impl Into<String>,
+        output: impl GlaconCoreOutputInit<Out>,
+    ) -> Self {
+        self.outputs.push((name.into(), Box::new(output)));
+        self
+    }
+
+    /// See [`RouteBuilder::fresh_state`].
+    pub fn fresh_state(mut self, fresh_state: FreshState) -> Self {
+        self.route.fresh_state = fresh_state;
+        self
+    }
+
     /// Validate and build the route.
-    pub fn build(self) -> Result<Route<R>> {
-        let RouteBuilder {
-            name,
-            inputs,
+    pub fn build(self) -> Result<Route<In, Out>> {
+        let RouteOutputs {
+            route:
+                RouteBuilder {
+                    name,
+                    inputs,
+                    settings,
+                    fresh_state,
+                },
             middleware,
             outputs,
-            settings,
-            fresh_state,
         } = self;
-        let middleware = middleware.unwrap_or_else(|| Box::new(|_| Ok(Box::new(AllOutputs))));
         let invalid = |reason: String| Error::invalid_route(&name, reason);
 
         check_name("route", &name).map_err(invalid)?;
@@ -123,24 +136,14 @@ impl<R: GlaconRecord> RouteBuilder<R> {
         if outputs.is_empty() {
             return Err(invalid("at least one output is required".into()));
         }
-        if outputs.len() > MAX_OUTPUTS {
-            return Err(invalid(format!(
-                "at most {MAX_OUTPUTS} outputs are supported"
-            )));
-        }
         check_names("input", inputs.iter().map(|(name, _)| name.as_str())).map_err(invalid)?;
         check_names("output", outputs.iter().map(|(name, _)| name.as_str())).map_err(invalid)?;
-
-        // Fails on an unknown output name; the processors get their own.
-        let index = OutputIndex::new(&name, outputs.iter().map(|(name, _)| name.as_str()));
-        middleware(&index)?;
 
         Ok(Route {
             name: name.as_str().into(),
             parts: Mutex::new(RouteParts {
                 inputs,
                 middleware,
-                index,
                 outputs,
                 settings,
                 fresh_state,
@@ -177,8 +180,8 @@ fn check_names<'a>(kind: &str, names: impl Iterator<Item = &'a str>) -> Result<(
 mod tests {
     use super::*;
     use crate::{
-        Batch, BatchId, BoxError, Destination, GlaconCoreInput, GlaconCoreOutput, InitializedInput,
-        InitializedOutput, InputContext, OutputContext, OutputId,
+        Batch, BatchId, BoxError, GlaconCoreInput, GlaconCoreOutput, InitializedInput,
+        InitializedOutput, InputContext, OutputContext,
     };
 
     struct In;
@@ -195,33 +198,35 @@ mod tests {
         }
     }
 
+    /// Writes any record type.
     struct Out;
     #[async_trait::async_trait]
-    impl GlaconCoreOutputInit<()> for Out {
+    impl<R: GlaconRecord> GlaconCoreOutputInit<R> for Out {
         async fn init(
             self: Box<Self>,
             _: &OutputContext,
-        ) -> Result<InitializedOutput<()>, BoxError> {
+        ) -> Result<InitializedOutput<R>, BoxError> {
             Ok(InitializedOutput::new(*self))
         }
     }
     #[async_trait::async_trait]
-    impl GlaconCoreOutput<()> for Out {
-        async fn handle_data(&mut self, _: &BatchId, _: &[&()]) -> Result<(), BoxError> {
+    impl<R: GlaconRecord> GlaconCoreOutput<R> for Out {
+        async fn handle_data(&mut self, _: &BatchId, _: &[R]) -> Result<(), BoxError> {
             Ok(())
         }
     }
 
-    /// Sends every record to one output.
-    struct Only(OutputId);
+    /// Turns every record into a number.
+    #[derive(Clone)]
+    struct Count;
     #[async_trait::async_trait]
-    impl GlaconCoreMiddleware<()> for Only {
+    impl GlaconCoreMiddleware<(), u32> for Count {
         async fn handle_data(
             &mut self,
             _: &BatchId,
-            records: &[()],
-        ) -> Result<Vec<Destination>, BoxError> {
-            Ok(vec![Destination::Only(self.0.into()); records.len()])
+            records: Vec<()>,
+        ) -> Result<Vec<u32>, BoxError> {
+            Ok((0..records.len() as u32).collect())
         }
     }
 
@@ -230,40 +235,41 @@ mod tests {
         Route::builder("route", RouteSettings::new("unused"))
     }
 
-    fn err(route_builder: RouteBuilder<()>) -> String {
-        match route_builder.build() {
+    fn err<Out: GlaconRecord>(route: RouteOutputs<(), Out>) -> String {
+        match route.build() {
             Ok(_) => panic!("expected an invalid route"),
             Err(e) => e.to_string(),
         }
     }
 
     #[test]
-    fn valid_route_builds_in_one_chain() -> Result<()> {
-        let route = test_route_builder()
+    fn builds_with_a_middleware_changing_the_record_type() -> Result<()> {
+        let route: Route<(), u32> = test_route_builder()
             .input("a", In)
             .input("b", In)
+            .middleware(Count)
             .output("x", Out)
             .output("y", Out)
-            .middleware_with(|outputs| Ok(Only(outputs.id("y")?)))
             .build()?;
         assert_eq!(route.name(), "route");
         Ok(())
     }
 
     #[test]
-    fn middleware_with_rejects_unknown_outputs() {
-        let e = err(test_route_builder()
+    fn builds_without_a_middleware() -> Result<()> {
+        let route: Route<()> = test_route_builder()
             .input("a", In)
             .output("x", Out)
-            .middleware_with(|outputs| Ok(Only(outputs.id("typo")?))));
-        assert!(e.contains("unknown output \"typo\""), "{e}");
+            .build()?;
+        assert_eq!(route.name(), "route");
+        Ok(())
     }
 
     #[test]
     fn needs_inputs_and_outputs() {
         let e = err(test_route_builder().output("x", Out));
         assert!(e.contains("at least one input"), "{e}");
-        let e = err(test_route_builder().input("a", In));
+        let e = err(test_route_builder().input("a", In).middleware(Count));
         assert!(e.contains("at least one output"), "{e}");
     }
 
@@ -288,14 +294,5 @@ mod tests {
             .input("a", In)
             .output("x", Out));
         assert!(e.contains("route name"), "{e}");
-    }
-
-    #[test]
-    fn caps_the_number_of_outputs() {
-        let mut route_builder = test_route_builder().input("a", In);
-        for i in 0..=MAX_OUTPUTS {
-            route_builder = route_builder.output(format!("o{i}"), Out);
-        }
-        assert!(err(route_builder).contains("at most 64 outputs"));
     }
 }

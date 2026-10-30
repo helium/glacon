@@ -6,8 +6,7 @@ use task_manager::ManagedTask;
 /// into a running [`GlaconCoreInput`] with `init`, before any task starts.
 ///
 /// An input must be **replayable**. The route records every batch it reads
-/// in its ledger and only marks it done once every output it was routed to
-/// has it. After a crash, the input must produce again the batches that are
+/// in its ledger and only marks it done once every output has it. After a crash, the input must produce again the batches that are
 /// not done: resume from [`InputContext::ledger`]'s `resume_point`, and skip
 /// what its `is_done` says (the route also skips done batches itself). A
 /// source that can't produce a batch again would lose it.

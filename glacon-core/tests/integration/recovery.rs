@@ -1,5 +1,5 @@
 //! Getting back on its feet: a route run again on the same state dir after
-//! a failure delivers every batch once to every output it was routed to.
+//! a failure delivers every batch once to every output.
 
 use crate::common::{self, End, Journal, MemoryInput, MemoryOutput, batch, event};
 use glacon_core::{Error, FreshState};
@@ -12,7 +12,7 @@ fn outputs(journal: &Journal) -> (MemoryOutput, MemoryOutput) {
     )
 }
 
-/// One input, `us`, producing batches `us.<n>` of one event each, routed to
+/// One input, `us`, producing batches `us.<n>` of one event each, kept by
 /// both outputs.
 fn input(batches: impl IntoIterator<Item = u32>, end: End, journal: &Journal) -> MemoryInput {
     let batches = batches
@@ -151,7 +151,7 @@ async fn done_batches_are_skipped() -> anyhow::Result<()> {
 }
 
 #[tokio::test]
-async fn a_batch_no_output_gets_is_done() -> anyhow::Result<()> {
+async fn a_batch_the_middleware_empties_is_done() -> anyhow::Result<()> {
     let state = tempfile::tempdir()?;
     let journal = Journal::default();
     let (left, right) = outputs(&journal);
@@ -177,6 +177,38 @@ async fn a_batch_no_output_gets_is_done() -> anyhow::Result<()> {
     let ledger = common::ledger(state.path(), "dropped").await?;
     assert!(ledger.is_done("us", "us.1").await?);
     assert_nothing_in_flight(state.path(), "dropped").await
+}
+
+#[tokio::test]
+async fn an_output_that_keeps_nothing_still_acknowledges() -> anyhow::Result<()> {
+    let state = tempfile::tempdir()?;
+    let journal = Journal::default();
+    let (left, right) = outputs(&journal);
+    let input = MemoryInput::new(
+        "us",
+        vec![batch("us.1", vec![event("r", "right")])],
+        End::Return,
+        &journal,
+    );
+
+    let route = common::route(
+        "nothing",
+        state.path(),
+        vec![input],
+        &left,
+        &right,
+        &journal,
+    )
+    .build()?;
+    common::run(route).await?;
+
+    // Both outputs were handed the batch; only right kept something.
+    assert_eq!(left.batches(), ["us.1"]);
+    assert!(left.rows().is_empty());
+    assert_eq!(right.rows(), ["r"]);
+    let ledger = common::ledger(state.path(), "nothing").await?;
+    assert!(ledger.is_done("us", "us.1").await?);
+    assert_nothing_in_flight(state.path(), "nothing").await
 }
 
 #[tokio::test]

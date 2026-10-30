@@ -93,11 +93,7 @@ async fn write<R: GlaconRecord>(
                 continue;
             }
         };
-        let Delivery {
-            ticket,
-            records,
-            picks,
-        } = delivery;
+        let Delivery { ticket, records } = delivery;
         let written = ticket.replayed
             && route_output
                 .output
@@ -108,7 +104,6 @@ async fn write<R: GlaconRecord>(
             metrics::output_counter(metrics::SKIPPED_DELIVERIES, route, output, 1);
             tracing::info!(route = %route, output = %output, batch = %ticket.id.key, "already written");
         } else {
-            let records: Vec<&R> = picks.iter().map(|&i| &records[i]).collect();
             route_output
                 .output
                 .handle_data(&ticket.id, &records)

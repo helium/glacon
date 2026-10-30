@@ -2,7 +2,15 @@
 //! records, and the fresh-state guard against tables that already hold data.
 
 use crate::common;
-use glacon_helium::{FileStoreInput, FreshState, IcebergOutput, Route, RouteBuilder};
+use glacon_helium::{FileStoreInput, FreshState, IcebergOutput, Route, RouteBuilder, RouteOutputs};
+
+/// Route `name` reading bucket `b`.
+fn input_builder(h: &common::Harness, name: &str, b: usize) -> RouteBuilder<common::Event> {
+    Route::builder(name, h.route_settings(name)).input(
+        "v1",
+        FileStoreInput::new(common::V1Input, h.input_settings(b, common::start_after())),
+    )
+}
 
 /// Route `name` from bucket `b` into the events table `table`.
 fn route_builder(
@@ -10,16 +18,11 @@ fn route_builder(
     name: &str,
     b: usize,
     table: &'static str,
-) -> RouteBuilder<common::Event> {
-    Route::builder(name, h.route_settings(name))
-        .input(
-            "v1",
-            FileStoreInput::new(common::V1Input, h.input_settings(b, common::start_after())),
-        )
-        .output(
-            common::EVENTS,
-            IcebergOutput::new(common::EventsTable(table), h.output_settings()),
-        )
+) -> RouteOutputs<common::Event, common::Event> {
+    input_builder(h, name, b).output(
+        common::EVENTS,
+        IcebergOutput::new(common::EventsTable(table), h.output_settings()),
+    )
 }
 
 #[tokio::test]
@@ -70,18 +73,17 @@ async fn the_ledger_records_each_file_done() -> anyhow::Result<()> {
     let second = h
         .put_file(b, common::V1_PREFIX, ts, vec![common::v1("b", "drop", 1)])
         .await?;
-    // Drops "drop" records: the second file goes nowhere.
-    let route = route_builder(&h, "ledger", b, "events")
+    // The middleware drops "drop" records: the second file goes nowhere.
+    let route = input_builder(&h, "ledger", b)
+        .middleware(common::DropKind)
+        .output(
+            common::EVENTS,
+            IcebergOutput::new(common::EventsTable("events"), h.output_settings()),
+        )
         .output(
             common::VALUES,
             IcebergOutput::new(common::ValuesTable("event_values"), h.output_settings()),
         )
-        .middleware_with(|outputs| {
-            Ok(common::ByKindMiddleware {
-                events: outputs.id(common::EVENTS)?,
-                values: outputs.id(common::VALUES)?,
-            })
-        })
         .build()?;
     common::run(route).await?;
 

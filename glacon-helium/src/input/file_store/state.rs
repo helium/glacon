@@ -10,7 +10,7 @@ use glacon_core::InputLedger;
 ///
 /// - resume point: the oldest file not delivered everywhere yet, else the
 ///   newest done one;
-/// - a file is skipped once done (every output it was routed to has it);
+/// - a file is skipped once done (every output has it);
 /// - done files are forgotten once out of the poller's window and older than
 ///   the route's retention.
 ///

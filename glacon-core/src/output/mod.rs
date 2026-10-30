@@ -1,4 +1,4 @@
-//! Outputs: where the records routed by the middleware are written. Each
+//! Outputs: where records are written, each keeping what it wants. Each
 //! output runs in its own task and is fed by every processor.
 
 mod context;

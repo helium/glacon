@@ -3,9 +3,9 @@
 Route records from inputs, through a middleware, to outputs: protobuf files
 from S3 buckets into Iceberg tables, for example.
 
-A **route** reads one record type from **N inputs**, runs every batch through
-a **middleware** that picks which of its **M outputs** get each record, and
-writes them. A route is an oracles `task_manager::ManagedTask`: run it in your
+A **route** reads records from **N inputs**, runs every batch through a
+**middleware** that transforms them, and hands them to its **M outputs**, each
+keeping the records it wants. A route is an oracles `task_manager::ManagedTask`: run it in your
 app's `TaskManager`, next to your other routes and tasks.
 
 ## Architecture
@@ -87,7 +87,7 @@ middleware, red are outputs.
 - Every input runs in its own task and feeds its own processor through a
   channel.
 - Every processor runs its own instance of the route's middleware, and sends
-  each output the records routed to it, through one channel per output.
+  every output the batch it transformed, through one channel per output.
 - Every output runs in its own task, fed by every processor.
 - Channels hold one batch besides the one being handled: a slow stage makes
   the stages before it wait.
@@ -108,8 +108,8 @@ then `terminate`.
 | Stage | `init` | main hook | `terminate` |
 |---|---|---|---|
 | input | `GlaconCoreInputInit::init(self, ctx)`: connect, build a poller, …; resume from `ctx.ledger()`; returns the running `GlaconCoreInput` and an optional background task (`InitializedInput`) | `GlaconCoreInput::next_batch()`: the next `Batch`, or `None` when done | — (the running input is dropped) |
-| middleware | `GlaconCoreMiddleware::init(&mut self, ctx)`: open a connection, … | `handle_data(&BatchId, &[R])`: one `Destination` per record (`All`, `Only(outputs)` or `Drop`) | release |
-| output | `GlaconCoreOutputInit::init(self, ctx)`: connect, create the table, …; returns the running `GlaconCoreOutput`, an optional background task, and whether the destination already holds data (`InitializedOutput::with_existing_data`) | `GlaconCoreOutput::handle_data(&BatchId, &[&R])`: write the records routed here, `Ok` once durable. Optional: `already_written(&BatchId)`, asked on replays | `GlaconCoreOutput::terminate`: flush |
+| middleware | `GlaconCoreMiddleware::init(&mut self, ctx)`: open a connection, … | `handle_data(&BatchId, Vec<In>) -> Vec<Out>`: transform the records, leaving out the ones to drop | release |
+| output | `GlaconCoreOutputInit::init(self, ctx)`: connect, create the table, …; returns the running `GlaconCoreOutput`, an optional background task, and whether the destination already holds data (`InitializedOutput::with_existing_data`) | `GlaconCoreOutput::handle_data(&BatchId, &[R])`: gets every record of the batch, writes the ones it keeps, `Ok` once durable. Optional: `already_written(&BatchId)`, asked on replays | `GlaconCoreOutput::terminate`: flush |
 
 An input's or output's `init` **consumes** its configuration (what you gave
 the builder, a `GlaconCoreInputInit` / `GlaconCoreOutputInit`) and returns
@@ -196,13 +196,15 @@ skips done batches itself too). S3 qualifies.
 1. **Input task**: after `next_batch`, the route records the batch in the
    ledger. A batch never seen is now `in_flight`, one already `in_flight` is a
    **replay**, one `done` is skipped.
-2. **Processor**: the middleware routes the records. On a replay, the outputs
-   that already took the batch are left out. No output left means the batch
-   is done right away. Otherwise every remaining output (a **target**) gets
-   its records, sharing one ticket that counts the targets.
+2. **Processor**: the middleware transforms the records. Every output (a
+   **target**) gets the whole batch, except, on a replay, the outputs that
+   already took it. A batch the middleware emptied, or with no target left,
+   is done right away. Otherwise the targets share one ticket that counts
+   them.
 3. **Output task**: on a replay, `already_written` is asked first (optional,
-   default no). Then `handle_data`: returning `Ok` means durable, and **is**
-   the acknowledgement. The output is recorded in `deliveries`, then counts
+   default no). Then `handle_data`, which writes the records this output
+   keeps (maybe none): returning `Ok` means durable, and **is** the
+   acknowledgement. The output is recorded in `deliveries`, then counts
    down the ticket. The last one marks the batch `done` (deliveries cleared,
    in one transaction).
 
@@ -218,21 +220,21 @@ sequenceDiagram
     participant V as Verified speed test Iceberg table<br/>(IcebergOutput, output verified)
     participant D as Dropped speed test Iceberg table<br/>(IcebergOutput, output dropped)
 
-    Note over I,D: file speedtest.1 = t1 (valid), t2 (invalid), t3 (valid)
+    Note over I,D: file speedtest.1 = t1 (valid), t2 (too slow), t3 (valid)
     I->>L: read(speedtest.1)
     L-->>I: never seen, now in_flight (replayed = false)
     I->>P: Batch speedtest.1 (replayed = false)
-    P->>P: VerifySpeedTest.handle_data(&BatchId, [t1, t2, t3])<br/>→ [Only(verified), Only(dropped), Only(verified)]
-    P->>P: picks: verified = [t1, t3], dropped = [t2]<br/>targets = verified, dropped
+    P->>P: VerifySpeedTest.handle_data(&BatchId, [t1, t2, t3])<br/>→ [t1, t2 (invalid_reason = too slow), t3]
+    P->>P: targets = verified, dropped (every output)
     par both targets at once
-        P->>V: Delivery speedtest.1 [t1, t3] (ticket remaining = 2)
+        P->>V: Delivery speedtest.1 [t1, t2, t3] (ticket remaining = 2)
     and
-        P->>D: Delivery speedtest.1 [t2] (same ticket)
+        P->>D: Delivery speedtest.1 [t1, t2, t3] (same ticket)
     end
-    V->>V: handle_data(&BatchId, [t1, t3]) → rows in the spool = durable
+    V->>V: handle_data(&BatchId, [t1, t2, t3])<br/>keeps t1, t3 (no invalid_reason) → rows in the spool = durable
     V->>L: deliver(speedtest.1, verified)
     V->>V: remaining 2 → 1
-    D->>D: handle_data(&BatchId, [t2]) → rows in the spool = durable
+    D->>D: handle_data(&BatchId, [t1, t2, t3])<br/>keeps t2 (invalid_reason set) → rows in the spool = durable
     D->>L: deliver(speedtest.1, dropped)
     D->>D: remaining 1 → 0
     D->>L: complete(speedtest.1): done, deliveries cleared
@@ -284,13 +286,13 @@ sequenceDiagram
     I->>L: read(speedtest.1)
     L-->>I: already in_flight → replayed = true
     I->>P: Batch speedtest.1 (replayed = true)
-    P->>P: VerifySpeedTest.handle_data(&BatchId, [t1, t2, t3])<br/>→ verified = [t1, t3], dropped = [t2]
+    P->>P: VerifySpeedTest.handle_data(&BatchId, [t1, t2, t3])<br/>→ [t1, t2 (invalid_reason = too slow), t3], as the first time
     P->>L: deliveries(speedtest.1)?
     L-->>P: verified → targets = dropped only
-    Note over V: not sent anything, it already has t1, t3
-    P->>D: Delivery speedtest.1 [t2] (replayed = true, remaining = 1)
+    Note over V: not sent anything, it already has the batch
+    P->>D: Delivery speedtest.1 [t1, t2, t3] (replayed = true, remaining = 1)
     D->>D: already_written(&BatchId)? (optional hook, default no)
-    D->>D: handle_data(&BatchId, [t2]) → durable
+    D->>D: handle_data(&BatchId, [t1, t2, t3]) → keeps t2, durable
     D->>L: deliver(speedtest.1, dropped)
     D->>D: remaining 1 → 0
     D->>L: complete(speedtest.1): done, deliveries cleared
@@ -306,13 +308,14 @@ newest done batch and every `in_flight` one. The retention must cover how far
 back an input may produce a batch again (a file store poller's `offset`): a
 forgotten batch seen again is delivered again.
 
-### Replay-safe middleware
+### Replay-safe middleware and outputs
 
-On a replay, the middleware sees the batch again, and must route its records
-the same way. A stateless middleware is. One with state, like a
-deduplicating one, keys it by `&BatchId`: remember which batch claimed each
-record, and keep a record its own batch claimed (see
-`deduplication_is_a_middleware` in `glacon-core/tests/integration/routing.rs`).
+On a replay, the middleware sees the batch again, and must give the same
+records. A stateless middleware does. One with state, like a deduplicating
+one, keys it by `&BatchId`: remember which batch claimed each record, and
+keep a record its own batch claimed (see `deduplication_is_a_middleware` in
+`glacon-core/tests/integration/routing.rs`). Likewise, an output decides what
+to keep from the record alone.
 
 ### Lost state: the fresh-state guard
 
@@ -344,55 +347,76 @@ startup to shutdown.
 
 ## Usage
 
+The middleware decides once whether a speed test is valid and sets the
+result on the record. Each table keeps what it wants: valid tests in one,
+invalid ones in the other. Malformed tests reach neither.
+
 ```rust
 use glacon_helium::{
-    BatchId, BoxError, Destination, FileStoreInput, GlaconCoreMiddleware, IcebergOutput,
-    OutputId, Route, RouteSettings, async_trait, task_manager::TaskManager,
+    BatchId, BoxError, FileStoreInput, GlaconCoreMiddleware, GlaconOutput, IcebergOutput,
+    Route, RouteSettings, async_trait, task_manager::TaskManager,
 };
 
-// One instance per input's processor.
-struct VerifySpeedTest {
-    verified: OutputId,
-    dropped: OutputId,
+/// What the outputs get: a speed test and the verdict on it.
+#[derive(Clone)]
+struct VerifiedSpeedTest {
+    test: SpeedTest,
+    invalid_reason: Option<InvalidReason>,
 }
 
+// Cloned for each input's processor.
+#[derive(Clone)]
+struct VerifySpeedTest;
+
 #[async_trait]
-impl GlaconCoreMiddleware<SpeedTest> for VerifySpeedTest {
+impl GlaconCoreMiddleware<SpeedTest, VerifiedSpeedTest> for VerifySpeedTest {
     async fn handle_data(
         &mut self,
         _: &BatchId,
-        tests: &[SpeedTest],
-    ) -> Result<Vec<Destination>, BoxError> {
+        tests: Vec<SpeedTest>,
+    ) -> Result<Vec<VerifiedSpeedTest>, BoxError> {
         Ok(tests
-            .iter()
-            .map(|t| if t.is_valid() { self.verified.into() } else { self.dropped.into() })
-            .map(Destination::Only)
+            .into_iter()
+            .filter(|t| !t.is_malformed()) // dropped: no output gets it
+            .map(|test| VerifiedSpeedTest { invalid_reason: test.verify(), test })
             .collect())
     }
 }
 
+impl GlaconOutput<VerifiedSpeedTest> for VerifiedTable {
+    // table() ...
+    fn to_rows(&self, t: &VerifiedSpeedTest, rows: &mut Vec<VerifiedRow>) {
+        if t.invalid_reason.is_none() {
+            rows.push(VerifiedRow::from(&t.test));
+        }
+    }
+}
+// DroppedTable keeps the tests whose invalid_reason is set, with the reason.
+
 // The ledger goes in /data/speedtests/state.db: a durable volume.
 let route = Route::builder("speedtests", RouteSettings::new("/data/speedtests"))
-    .input("us", FileStoreInput::new(SpeedTestInput, us_settings))
+    .input("us", FileStoreInput::new(SpeedTestInput, us_settings))   // SpeedTest
     .input("eu", FileStoreInput::new(SpeedTestInput, eu_settings))
+    .middleware(VerifySpeedTest)                                      // -> VerifiedSpeedTest
     .output("verified", IcebergOutput::new(VerifiedTable, verified_settings))
     .output("dropped", IcebergOutput::new(DroppedTable, dropped_settings))
-    // Output names become ids: a typo fails build().
-    .middleware_with(|outputs| {
-        Ok(VerifySpeedTest {
-            verified: outputs.id("verified")?,
-            dropped: outputs.id("dropped")?,
-        })
-    })
     .build()?;
 
 TaskManager::builder().add_task(route).build().start().await?;
 ```
 
-- A route has one middleware. `middleware_with` builds it from the outputs'
-  ids: it runs once in `build()` to check the names, then once per input
-  when the route starts. `middleware(m)` clones `m` for each input instead.
-  Without either, every record goes to every output (`AllOutputs`).
+- The builder follows the data: inputs, then the middleware, then outputs.
+  The middleware sets the type outputs get, so the compiler enforces the
+  order.
+- A route has one middleware, given as a value implementing
+  `GlaconCoreMiddleware` and cloned for each input's processor. Share state
+  between the clones through an `Arc`; create what can't be cloned (a
+  connection) in its `init`. Without one, outputs get the inputs' records
+  unchanged (`Passthrough`).
+- **Drop or annotate.** A record no output should get (malformed, a
+  duplicate) is dropped by the middleware, leaving it out. A decision outputs
+  depend on (valid or not) is set on the record, and each output filters on
+  it.
 - Give every route its own `state_dir`. `RouteSettings` is serde-ready
   (`state_dir`, `processed_retention`).
 - `Route` names its tasks `input <name>`, `processor <name>` and
@@ -403,7 +427,7 @@ TaskManager::builder().add_task(route).build().start().await?;
 | You implement | Wrapped by | Does |
 |---|---|---|
 | `GlaconInput` | `FileStoreInput::new(input, InputSettings)` | One kind of file: file prefix + protobuf message → record. Returning `None` drops the message (logged at error, counted). |
-| `GlaconOutput` | `IcebergOutput::new(output, OutputSettings)` | One table: its definition + record → 0..n rows. |
+| `GlaconOutput` | `IcebergOutput::new(output, OutputSettings)` | One table: its definition + record → 0..n rows. It gets every record: no rows drops one. |
 
 `InputSettings` and `OutputSettings` are serde-ready so apps can embed them in
 their own configuration.
@@ -430,7 +454,6 @@ snapshot (see the fresh-state guard).
   unpartitioned table.
 - Missing tables are created from `GlaconOutput::table()`. Schema changes are
   not handled.
-- At most 64 outputs per route.
 
 ## Metrics
 
@@ -440,8 +463,9 @@ series has a `route` label, plus `input` or `output` where it applies:
 - `glacon_processed_batches_total`
 - `glacon_batch_lag_seconds`
 - `glacon_batch_processing_seconds`
-- `glacon_middleware_dropped_total`
-- `glacon_output_records_total`
+- `glacon_middleware_dropped_total`: records the middleware left out
+- `glacon_output_records_total`: records handed to an output (it may keep
+  fewer: see `glacon_output_rows_total`)
 - `glacon_replayed_batches_total`: batches read again after a run that did
   not finish them
 - `glacon_skipped_deliveries_total`: deliveries skipped because the output

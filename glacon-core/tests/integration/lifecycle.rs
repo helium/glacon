@@ -6,7 +6,7 @@
 use crate::common::{
     self, BackgroundEnd, ChannelInput, End, Journal, MemoryInput, MemoryOutput, batch, event,
 };
-use glacon_core::{Error, task_manager::TaskManager};
+use glacon_core::{Error, Route, task_manager::TaskManager};
 
 fn outputs(journal: &Journal) -> (MemoryOutput, MemoryOutput) {
     (
@@ -405,9 +405,9 @@ async fn an_input_ends_when_its_background_task_does() -> anyhow::Result<()> {
         &journal,
     );
 
-    let route = common::route("channel", state.path(), Vec::new(), &left, &right, &journal)
-        .input(feed.name, feed)
-        .build()?;
+    let builder =
+        Route::builder("channel", common::settings(state.path(), "channel")).input(feed.name, feed);
+    let route = common::route_from(builder, &left, &right, &journal).build()?;
     common::run(route).await?;
 
     assert_eq!(left.rows(), ["a", "b"]);
