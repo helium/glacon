@@ -1,15 +1,18 @@
-//! Records from N inputs, transformed by each input's middleware, kept or
-//! not by each of M outputs.
+//! The middleware: records from N inputs, transformed by each input's
+//! middleware (changing their type, dropping some), then kept or not by each
+//! of M outputs; a failing middleware fails the route.
 
 use crate::common::{self, End, Journal, MemoryInput, MemoryOutput, batch, event};
 use glacon_core::{
-    BatchId, BoxError, GlaconCoreMiddleware, GlaconCoreOutput, InitializedOutput, OutputContext,
-    Route, async_trait,
+    BatchId, BoxError, Error, GlaconCoreMiddleware, GlaconCoreOutput, InitializedOutput,
+    OutputContext, Route, async_trait,
 };
 use std::{
     collections::{HashMap, HashSet},
     sync::{Arc, Mutex, PoisonError},
 };
+
+// ---------------------------------------------------------------- transforming
 
 #[tokio::test]
 async fn routes_records_to_outputs() -> anyhow::Result<()> {
@@ -235,5 +238,68 @@ async fn deduplication_is_a_middleware() -> anyhow::Result<()> {
     common::run(route).await?;
 
     assert_eq!(output.rows(), ["a", "b", "c"]);
+    Ok(())
+}
+
+// ---------------------------------------------------------------- dropping and failing
+
+#[tokio::test]
+async fn a_batch_the_middleware_empties_is_done() -> anyhow::Result<()> {
+    let state = tempfile::tempdir()?;
+    let journal = Journal::default();
+    let (left, right) = common::outputs(&journal);
+    let input = MemoryInput::new(
+        "us",
+        vec![batch("us.1", vec![event("x", "drop")])],
+        End::Return,
+        &journal,
+    );
+
+    let route = common::route(
+        "dropped",
+        state.path(),
+        vec![input],
+        &left,
+        &right,
+        &journal,
+    )
+    .build()?;
+    common::run(route).await?;
+
+    assert!(left.batches().is_empty() && right.batches().is_empty());
+    let ledger = common::ledger(state.path(), "dropped").await?;
+    assert!(ledger.is_done("us", "us.1").await?);
+    common::assert_nothing_in_flight(state.path(), "dropped").await
+}
+
+#[tokio::test]
+async fn a_failing_middleware_fails_the_route() -> anyhow::Result<()> {
+    let state = tempfile::tempdir()?;
+    let journal = Journal::default();
+    let (left, right) = common::outputs(&journal);
+    let input = MemoryInput::new(
+        "us",
+        vec![batch("us.1", vec![event("x", "fail")])],
+        End::HoldOpen,
+        &journal,
+    );
+
+    let route = common::route(
+        "middleware",
+        state.path(),
+        vec![input],
+        &left,
+        &right,
+        &journal,
+    )
+    .build()?;
+    let err = common::run(route).await.expect_err("must fail");
+
+    let err = common::route_error(&err);
+    assert!(
+        matches!(err, Error::Middleware { input, .. } if input == "us"),
+        "{err}"
+    );
+    common::assert_down_order(&journal);
     Ok(())
 }

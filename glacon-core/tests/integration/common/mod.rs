@@ -586,3 +586,60 @@ pub fn route_error(err: &TaskError) -> &Error {
     e.downcast_ref::<Error>()
         .unwrap_or_else(|| panic!("not a glacon error: {e}"))
 }
+
+// ---------------------------------------------------------------- helpers
+
+/// The `left` and `right` outputs.
+pub fn outputs(journal: &Journal) -> (MemoryOutput, MemoryOutput) {
+    (
+        MemoryOutput::new(LEFT, journal),
+        MemoryOutput::new(RIGHT, journal),
+    )
+}
+
+/// Every stage stops after everything upstream of it: an input (dropped)
+/// before its middleware terminates, every middleware before any output, and
+/// every write of an output before it terminates.
+pub fn assert_down_order(journal: &Journal) {
+    let entries = journal.entries();
+    let position = |entry: &str| entries.iter().position(|e| e == entry);
+    for entry in &entries {
+        if let Some(input) = entry.strip_prefix("drop input ") {
+            let middleware = position(&format!("terminate middleware {input}"));
+            assert!(
+                middleware.is_some_and(|m| Some(m) > position(entry)),
+                "middleware of {input} not terminated after it: {entries:?}"
+            );
+        }
+    }
+    journal.assert_before("terminate middleware", "terminate output");
+    for output in [LEFT, RIGHT] {
+        let terminated = journal.positions(&format!("terminate output {output}"));
+        let writes = journal.positions(&format!("write {output}"));
+        assert!(
+            writes.iter().all(|w| terminated.iter().all(|t| w < t)),
+            "{output} wrote after terminating: {entries:?}"
+        );
+    }
+}
+
+/// One input, `us`, producing batches `us.<n>` of one event each, kept by
+/// both outputs.
+pub fn us_input(
+    batches: impl IntoIterator<Item = u32>,
+    end: End,
+    journal: &Journal,
+) -> MemoryInput {
+    let batches = batches
+        .into_iter()
+        .map(|n| batch(&format!("us.{n}"), vec![event(&format!("e{n}"), "both")]))
+        .collect();
+    MemoryInput::new("us", batches, end, journal)
+}
+
+/// The ledger of `route` has no batch of `us` in flight.
+pub async fn assert_nothing_in_flight(state: &Path, route: &str) -> anyhow::Result<()> {
+    let ledger = ledger(state, route).await?;
+    assert_eq!(ledger.in_flight("us").await?, 0);
+    Ok(())
+}

@@ -1,10 +1,9 @@
-//! Integration tests. Need the docker compose services:
+//! Integration tests, one file per part of glacon-helium. Need the docker
+//! compose services:
 //!
 //!   docker compose up -d --wait
 
 mod common;
-mod crash;
-mod end_to_end;
+mod file_store_input;
+mod iceberg_output;
 mod middleware;
-mod runtime;
-mod state;

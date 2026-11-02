@@ -315,8 +315,8 @@ On a replay, the middleware sees the batch again, and must give the same
 records. A stateless middleware does. One with state, like a deduplicating
 one, keys it by `&BatchId`: remember which batch claimed each record, and
 keep a record its own batch claimed (see `deduplication_is_a_middleware` in
-`glacon-core/tests/integration/routing.rs`). Likewise, an output decides what
-to keep from the record alone.
+`glacon-core/tests/integration/middleware.rs`). Likewise, an output decides
+what to keep from the record alone.
 
 ### Lost state: the fresh-state guard
 
@@ -339,8 +339,9 @@ its next start. Two caveats, from `helium_iceberg`:
 - a crash after a commit but before its spool file is removed commits that
   file again on the next start, duplicating up to `max_batch_rows` rows.
 
-`glacon-helium/tests/integration/crash.rs` kills a route with SIGKILL
-mid-run and checks that a restart loses nothing.
+`a_killed_route_loses_nothing_on_restart`, in
+`glacon-helium/tests/integration/iceberg_output.rs`, kills a route with
+SIGKILL mid-run and checks that a restart loses nothing.
 
 [docs/runtime.md](docs/runtime.md) shows how a route is split into Tokio
 tasks, where your code runs, and every step a record goes through from

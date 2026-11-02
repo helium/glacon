@@ -1,6 +1,6 @@
 //! Fixtures shared by the integration tests: one record type fed by two
 //! inputs with different protobuf messages, two outputs with different row
-//! types, and a middleware that routes on the record's kind.
+//! types, and a middleware dropping one kind of record.
 
 pub mod harness;
 pub mod metrics;
@@ -9,7 +9,8 @@ pub use harness::Harness;
 
 use chrono::{DateTime, Duration, Utc};
 use glacon_helium::{
-    BatchId, BoxError, FileMeta, GlaconCoreMiddleware, GlaconInput, GlaconOutput, async_trait,
+    BatchId, BoxError, FileMeta, FileStoreInput, GlaconCoreMiddleware, GlaconInput, GlaconOutput,
+    IcebergOutput, Route, RouteBuilder, RouteOutputs, async_trait,
     helium_iceberg::{FieldDefinition, PartitionDefinition, TableDefinition},
     task_manager::ManagedTask,
 };
@@ -254,6 +255,27 @@ pub fn start_after() -> DateTime<Utc> {
 
 pub fn minutes_ago(minutes: i64) -> DateTime<Utc> {
     Utc::now() - Duration::minutes(minutes)
+}
+
+/// Route `name` reading bucket `b`.
+pub fn input_builder(h: &Harness, name: &str, b: usize) -> RouteBuilder<Event> {
+    Route::builder(name, h.route_settings(name)).input(
+        "v1",
+        FileStoreInput::new(V1Input, h.input_settings(b, start_after())),
+    )
+}
+
+/// Route `name` from bucket `b` into the events table `table`.
+pub fn route_builder(
+    h: &Harness,
+    name: &str,
+    b: usize,
+    table: &'static str,
+) -> RouteOutputs<Event, Event> {
+    input_builder(h, name, b).output(
+        EVENTS,
+        IcebergOutput::new(EventsTable(table), h.output_settings()),
+    )
 }
 
 /// Run a route, or a TaskManager of routes, until it finishes (inputs stop
