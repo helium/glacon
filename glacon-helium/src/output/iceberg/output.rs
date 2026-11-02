@@ -1,11 +1,9 @@
 use super::{GlaconOutput, OutputSettings};
 use crate::metrics;
 use glacon_core::{
-    BatchId, BoxError, GlaconCoreOutput, GlaconCoreOutputInit, GlaconRecord, InitializedOutput,
-    OutputContext,
+    BatchId, BoxError, GlaconCoreOutput, GlaconRecord, InitializedOutput, OutputContext,
 };
 use helium_iceberg::{BatchedWriter, BatchedWriterConfig};
-use std::marker::PhantomData;
 
 /// A [`GlaconCoreOutput`] writing one Iceberg table, whose rows a
 /// [`GlaconOutput`] makes from records. Rows go through a
@@ -36,19 +34,24 @@ impl<O> IcebergOutput<O> {
 }
 
 #[async_trait::async_trait]
-impl<O, R> GlaconCoreOutputInit<R> for IcebergOutput<O>
+impl<O, R> GlaconCoreOutput<R> for IcebergOutput<O>
 where
     O: GlaconOutput<R>,
     R: GlaconRecord,
 {
+    type State = IcebergState<O::Row>;
+
     /// Connect the catalog, create the table if missing and build its
     /// writer, spooling to `<spool_dir>/<route>/<output>`. The writer's task
     /// is returned for the route to run. Reports existing data when the
     /// table existed with a snapshot.
-    async fn init(self: Box<Self>, ctx: &OutputContext) -> Result<InitializedOutput<R>, BoxError> {
-        let IcebergOutput { output, settings } = *self;
+    async fn init(
+        &mut self,
+        ctx: &OutputContext,
+    ) -> Result<InitializedOutput<Self::State>, BoxError> {
+        let settings = &self.settings;
         let catalog = settings.catalog.connect().await?;
-        let definition = output.table()?;
+        let definition = self.output.table()?;
         let (namespace, name) = (definition.namespace(), definition.name());
         catalog.create_namespace_if_not_exists(namespace).await?;
         let has_data = catalog.table_exists(namespace, name).await?
@@ -68,39 +71,24 @@ where
             .with_batch_timeout(settings.batch_timeout);
         let (writer, task) = BatchedWriter::new(table, config);
 
-        let running = RunningIcebergOutput {
-            output,
+        let state = IcebergState {
             ctx: ctx.clone(),
             writer,
-            _record: PhantomData,
         };
-        Ok(InitializedOutput::new(running)
+        Ok(InitializedOutput::new(state)
             .with_task(task)
             .with_existing_data(has_data))
     }
-}
 
-/// An [`IcebergOutput`] once initialized: turns records into rows and queues
-/// them to the table's batched writer.
-struct RunningIcebergOutput<O: GlaconOutput<R>, R> {
-    output: O,
-    ctx: OutputContext,
-    /// The handle to the batched writer. Dropped with this writer, which
-    /// lets the writer's task commit and exit.
-    writer: BatchedWriter<O::Row>,
-    _record: PhantomData<fn(&R)>,
-}
-
-#[async_trait::async_trait]
-impl<O, R> GlaconCoreOutput<R> for RunningIcebergOutput<O, R>
-where
-    O: GlaconOutput<R>,
-    R: GlaconRecord,
-{
     /// Turn the records into rows and queue them; returns once they are in
     /// the spool. Records without rows are the ones this table drops: a
     /// batch with none at all queues nothing.
-    async fn handle_data(&mut self, _: &BatchId, records: &[R]) -> Result<(), BoxError> {
+    async fn handle_data(
+        &mut self,
+        state: &mut Self::State,
+        _: &BatchId,
+        records: &[R],
+    ) -> Result<(), BoxError> {
         let mut rows = Vec::new();
         for record in records {
             self.output.to_rows(record, &mut rows);
@@ -109,13 +97,21 @@ where
             return Ok(());
         }
         let count = rows.len() as u64;
-        self.writer.queue_all(rows).await?;
+        state.writer.queue_all(rows).await?;
         metrics::output_counter(
             metrics::OUTPUT_ROWS,
-            self.ctx.route(),
-            self.ctx.output(),
+            state.ctx.route(),
+            state.ctx.output(),
             count,
         );
         Ok(())
     }
+}
+
+/// The state of an [`IcebergOutput`]: its table's batched writer.
+pub struct IcebergState<Row> {
+    ctx: OutputContext,
+    /// The handle to the batched writer. Dropped with this state, which
+    /// lets the writer's task commit and exit.
+    writer: BatchedWriter<Row>,
 }

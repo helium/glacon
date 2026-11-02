@@ -34,13 +34,13 @@ your task (e.g. main, calling task_manager.start().await)
   route's own `TaskManager`: it waits on the stage tasks, stops them in order,
   and fails if one of them fails. No data passes through it.
 - **The input task** ([input/task.rs](../glacon-core/src/input/task.rs))
-  calls your running input's `next_batch`, records each batch in the route's
+  calls your input's `next_batch`, records each batch in the route's
   ledger (`state.db`), and sends it to its processor.
 - **The processor task** ([processor/task.rs](../glacon-core/src/processor/task.rs))
   runs the input's own middleware over each batch and sends every output the
   transformed batch (on a replay, only the outputs that don't have it yet).
 - **The output task** ([output/task.rs](../glacon-core/src/output/task.rs))
-  calls your running output's `handle_data` with those records (it writes
+  calls your output's `handle_data` with those records (it writes
   the ones it keeps), then records in the ledger that it has the batch.
 - **Background tasks** are what an input's or output's `init` returned: for
   glacon-helium, the `file_store` poller and the `helium_iceberg` writer.
@@ -63,9 +63,9 @@ background task always starts before its stage and stops after it.
 | Your code | Task | When |
 |---|---|---|
 | `Clone` of your middleware | route | once per input, at start |
-| `GlaconCoreOutputInit::init` (`IcebergOutput`: `GlaconOutput::table()`), returning the running output and its background task | route | once per output, at start |
+| `GlaconCoreOutput::init` (`IcebergOutput`: `GlaconOutput::table()`), returning the output's state and its background task | route | once per output, at start |
 | `GlaconCoreMiddleware::init` | route | once per input, at start |
-| `GlaconCoreInputInit::init`, returning the running input and its background task | route | once per input, at start |
+| `GlaconCoreInput::init`, returning the input's state and its background task | route | once per input, at start |
 | `GlaconCoreInput::next_batch` (`FileStoreInput`: `GlaconInput::decode`) | input | per batch (per message for `decode`) |
 | `GlaconCoreMiddleware::handle_data` | processor | per batch |
 | `GlaconCoreOutput::already_written` | output | per replayed batch it doesn't have yet |

@@ -27,12 +27,11 @@ pub use fresh_state::FreshState;
 pub use settings::RouteSettings;
 
 use crate::{
-    BoxError, Error, GlaconCoreInputInit, GlaconCoreOutputInit, GlaconRecord, InputContext,
-    MiddlewareContext, OutputContext, Result,
-    input::{self, PendingInput, RouteInput},
+    BoxError, Error, GlaconRecord, InputContext, MiddlewareContext, OutputContext, Result,
+    input::{self, InitInput, PendingInput, RouteInput},
     ledger::{InputLedger, Ledger},
     lifecycle::{Initialized, init_all, terminate_all},
-    output::{self, PendingOutput, RouteOutput},
+    output::{self, InitOutput, PendingOutput, RouteOutput},
     processor::{self, OutputSender, RouteMiddleware},
     task::{BackgroundTask, Owner, RouteTask, unwrap_task_error},
 };
@@ -56,9 +55,9 @@ pub struct Route<In, Out = In> {
 }
 
 struct RouteParts<In, Out> {
-    inputs: Vec<(String, Box<dyn GlaconCoreInputInit<In>>)>,
+    inputs: Vec<(String, Box<dyn InitInput<In>>)>,
     middleware: MiddlewareFactory<In, Out>,
-    outputs: Vec<(String, Box<dyn GlaconCoreOutputInit<Out>>)>,
+    outputs: Vec<(String, Box<dyn InitOutput<Out>>)>,
     settings: RouteSettings,
     fresh_state: FreshState,
 }

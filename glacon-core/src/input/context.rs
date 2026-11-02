@@ -1,7 +1,7 @@
 use crate::ledger::InputLedger;
 use std::sync::Arc;
 
-/// Handed to [`GlaconCoreInputInit::init`](super::GlaconCoreInputInit::init).
+/// Handed to [`GlaconCoreInput::init`](super::GlaconCoreInput::init).
 #[derive(Debug, Clone)]
 pub struct InputContext {
     pub(crate) route: Arc<str>,

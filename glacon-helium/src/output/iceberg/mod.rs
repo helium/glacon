@@ -5,6 +5,6 @@ mod output;
 mod settings;
 mod r#trait;
 
-pub use output::IcebergOutput;
+pub use output::{IcebergOutput, IcebergState};
 pub use settings::OutputSettings;
 pub use r#trait::GlaconOutput;

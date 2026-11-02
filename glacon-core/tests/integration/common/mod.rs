@@ -8,10 +8,9 @@
 
 use chrono::Utc;
 use glacon_core::{
-    Batch, BatchId, BoxError, Error, GlaconCoreInput, GlaconCoreInputInit, GlaconCoreMiddleware,
-    GlaconCoreOutput, GlaconCoreOutputInit, InitializedInput, InitializedOutput, InputContext,
-    Ledger, MiddlewareContext, OutputContext, Route, RouteBuilder, RouteOutputs, RouteSettings,
-    async_trait,
+    Batch, BatchId, BoxError, Error, GlaconCoreInput, GlaconCoreMiddleware, GlaconCoreOutput,
+    InitializedInput, InitializedOutput, InputContext, Ledger, MiddlewareContext, OutputContext,
+    Route, RouteBuilder, RouteOutputs, RouteSettings, async_trait,
     task_manager::{self, ManagedTask, TaskError, TaskFuture, TaskResult},
 };
 use std::{
@@ -141,7 +140,7 @@ impl ManagedTask for Background {
 // ---------------------------------------------------------------- input
 
 /// Hands out its batches, then returns, fails, panics or waits to be
-/// stopped. Its running input journals `drop input <name>` when dropped: the marker
+/// stopped. Its state journals `drop input <name>` when dropped: the marker
 /// that its task ended.
 pub struct MemoryInput {
     pub name: &'static str,
@@ -181,61 +180,41 @@ impl MemoryInput {
 }
 
 #[async_trait]
-impl GlaconCoreInputInit<Event> for MemoryInput {
+impl GlaconCoreInput<Event> for MemoryInput {
+    type State = MemoryState;
+
     async fn init(
-        self: Box<Self>,
+        &mut self,
         ctx: &InputContext,
-    ) -> Result<InitializedInput<Event>, BoxError> {
-        let MemoryInput {
-            name,
-            batches,
-            end,
-            fail_init,
-            background,
-            journal,
-        } = *self;
+    ) -> Result<InitializedInput<MemoryState>, BoxError> {
+        let name = self.name;
         assert_eq!(ctx.input(), name);
-        if fail_init {
+        if self.fail_init {
             return Err("input init failure".into());
         }
-        journal.push(format!("init input {name}"));
-        let task = background.map(|end| {
+        self.journal.push(format!("init input {name}"));
+        let task = self.background.take().map(|end| {
             Box::new(Background {
                 name: format!("input {name}"),
                 end,
-                journal: journal.clone(),
+                journal: self.journal.clone(),
             }) as Box<dyn ManagedTask>
         });
         Ok(InitializedInput {
-            input: Box::new(RunningMemoryInput {
+            state: MemoryState {
                 name,
-                batches,
-                end,
-                journal,
-            }),
+                batches: std::mem::take(&mut self.batches),
+                journal: self.journal.clone(),
+            },
             task,
         })
     }
-}
 
-/// A [`MemoryInput`] once initialized.
-struct RunningMemoryInput {
-    name: &'static str,
-    batches: VecDeque<Batch<Event>>,
-    end: End,
-    journal: Journal,
-}
-
-impl Drop for RunningMemoryInput {
-    fn drop(&mut self) {
-        self.journal.push(format!("drop input {}", self.name));
-    }
-}
-
-#[async_trait]
-impl GlaconCoreInput<Event> for RunningMemoryInput {
-    async fn next_batch(&mut self) -> Result<Option<Batch<Event>>, BoxError> {
-        if let Some(batch) = self.batches.pop_front() {
+    async fn next_batch(
+        &mut self,
+        state: &mut MemoryState,
+    ) -> Result<Option<Batch<Event>>, BoxError> {
+        if let Some(batch) = state.batches.pop_front() {
             return Ok(Some(batch));
         }
         match self.end {
@@ -247,8 +226,21 @@ impl GlaconCoreInput<Event> for RunningMemoryInput {
     }
 }
 
+/// The state of a [`MemoryInput`]: the batches left.
+pub struct MemoryState {
+    name: &'static str,
+    batches: VecDeque<Batch<Event>>,
+    journal: Journal,
+}
+
+impl Drop for MemoryState {
+    fn drop(&mut self) {
+        self.journal.push(format!("drop input {}", self.name));
+    }
+}
+
 /// An input shaped like a poller: its background task produces the batches
-/// into a channel, then ends; the running input reads the channel, so it
+/// into a channel, then ends; the input reads the channel from its state, so it
 /// ends once the background task has.
 pub struct ChannelInput {
     pub name: &'static str,
@@ -295,32 +287,27 @@ impl ManagedTask for Feeder {
     }
 }
 
-/// A [`ChannelInput`] once initialized.
-struct RunningChannelInput(mpsc::Receiver<Batch<Event>>);
-
 #[async_trait]
-impl GlaconCoreInputInit<Event> for ChannelInput {
-    async fn init(self: Box<Self>, _: &InputContext) -> Result<InitializedInput<Event>, BoxError> {
-        let ChannelInput {
-            name,
-            batches,
-            journal,
-        } = *self;
+impl GlaconCoreInput<Event> for ChannelInput {
+    /// What the feeder sends.
+    type State = mpsc::Receiver<Batch<Event>>;
+
+    async fn init(&mut self, _: &InputContext) -> Result<InitializedInput<Self::State>, BoxError> {
         let (sender, received) = mpsc::channel(1);
         let feeder = Feeder {
-            name: format!("input {name}"),
-            batches,
+            name: format!("input {}", self.name),
+            batches: std::mem::take(&mut self.batches),
             sender,
-            journal,
+            journal: self.journal.clone(),
         };
-        Ok(InitializedInput::new(RunningChannelInput(received)).with_task(feeder))
+        Ok(InitializedInput::new(received).with_task(feeder))
     }
-}
 
-#[async_trait]
-impl GlaconCoreInput<Event> for RunningChannelInput {
-    async fn next_batch(&mut self) -> Result<Option<Batch<Event>>, BoxError> {
-        Ok(self.0.recv().await)
+    async fn next_batch(
+        &mut self,
+        received: &mut Self::State,
+    ) -> Result<Option<Batch<Event>>, BoxError> {
+        Ok(received.recv().await)
     }
 }
 
@@ -408,51 +395,6 @@ impl MemoryOutput {
     }
 }
 
-#[async_trait]
-impl GlaconCoreOutputInit<Event> for MemoryOutput {
-    async fn init(
-        self: Box<Self>,
-        ctx: &OutputContext,
-    ) -> Result<InitializedOutput<Event>, BoxError> {
-        assert_eq!(ctx.output(), self.name);
-        if self.fail_init {
-            return Err("output init failure".into());
-        }
-        self.journal.push(format!("init output {}", self.name));
-        let task = self.background.map(|end| {
-            Box::new(Background {
-                name: format!("output {}", self.name),
-                end,
-                journal: self.journal.clone(),
-            }) as Box<dyn ManagedTask>
-        });
-        let has_data = !self.rows().is_empty();
-        let mut initialized = InitializedOutput::new(RunningMemoryOutput {
-            name: self.name,
-            rows: self.rows.clone(),
-            batches: self.batches.clone(),
-            failing_writes: self.failing_writes.clone(),
-            failing_after_writes: self.failing_after_writes.clone(),
-            knows_written: self.knows_written,
-            journal: self.journal.clone(),
-        })
-        .with_existing_data(has_data);
-        initialized.task = task;
-        Ok(initialized)
-    }
-}
-
-/// A [`MemoryOutput`] once initialized.
-struct RunningMemoryOutput {
-    name: &'static str,
-    rows: Arc<Mutex<Vec<String>>>,
-    batches: Arc<Mutex<Vec<String>>>,
-    failing_writes: Arc<AtomicUsize>,
-    failing_after_writes: Arc<AtomicUsize>,
-    knows_written: bool,
-    journal: Journal,
-}
-
 /// Takes one from `n` if not zero yet.
 fn take_one(n: &AtomicUsize) -> bool {
     n.fetch_update(Ordering::SeqCst, Ordering::SeqCst, |n| n.checked_sub(1))
@@ -460,8 +402,34 @@ fn take_one(n: &AtomicUsize) -> bool {
 }
 
 #[async_trait]
-impl GlaconCoreOutput<Event> for RunningMemoryOutput {
-    async fn handle_data(&mut self, batch: &BatchId, records: &[Event]) -> Result<(), BoxError> {
+impl GlaconCoreOutput<Event> for MemoryOutput {
+    type State = ();
+
+    async fn init(&mut self, ctx: &OutputContext) -> Result<InitializedOutput<()>, BoxError> {
+        assert_eq!(ctx.output(), self.name);
+        if self.fail_init {
+            return Err("output init failure".into());
+        }
+        self.journal.push(format!("init output {}", self.name));
+        let task = self.background.take().map(|end| {
+            Box::new(Background {
+                name: format!("output {}", self.name),
+                end,
+                journal: self.journal.clone(),
+            }) as Box<dyn ManagedTask>
+        });
+        let mut initialized =
+            InitializedOutput::new(()).with_existing_data(!self.rows().is_empty());
+        initialized.task = task;
+        Ok(initialized)
+    }
+
+    async fn handle_data(
+        &mut self,
+        _: &mut (),
+        batch: &BatchId,
+        records: &[Event],
+    ) -> Result<(), BoxError> {
         if take_one(&self.failing_writes) {
             return Err(format!("{} write failure", self.name).into());
         }
@@ -485,7 +453,7 @@ impl GlaconCoreOutput<Event> for RunningMemoryOutput {
         Ok(())
     }
 
-    async fn already_written(&mut self, batch: &BatchId) -> Result<bool, BoxError> {
+    async fn already_written(&mut self, _: &mut (), batch: &BatchId) -> Result<bool, BoxError> {
         let written = self
             .batches
             .lock()
@@ -494,7 +462,7 @@ impl GlaconCoreOutput<Event> for RunningMemoryOutput {
         Ok(self.knows_written && written)
     }
 
-    async fn terminate(&mut self) -> Result<(), BoxError> {
+    async fn terminate(&mut self, _: &mut ()) -> Result<(), BoxError> {
         self.journal.push(format!("terminate output {}", self.name));
         Ok(())
     }

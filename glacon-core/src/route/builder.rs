@@ -1,7 +1,7 @@
 use super::{FreshState, Route, RouteParts, RouteSettings};
 use crate::{
-    Error, GlaconCoreInputInit, GlaconCoreMiddleware, GlaconCoreOutputInit, GlaconRecord,
-    Passthrough, Result,
+    Error, GlaconCoreInput, GlaconCoreMiddleware, GlaconCoreOutput, GlaconRecord, Passthrough,
+    Result, input::InitInput, output::InitOutput,
 };
 use std::{collections::HashSet, sync::Mutex};
 
@@ -40,7 +40,7 @@ impl<In: GlaconRecord> Route<In> {
 /// ([`Passthrough`]).
 pub struct RouteBuilder<In> {
     name: String,
-    inputs: Vec<(String, Box<dyn GlaconCoreInputInit<In>>)>,
+    inputs: Vec<(String, Box<dyn InitInput<In>>)>,
     settings: RouteSettings,
     fresh_state: FreshState,
 }
@@ -48,7 +48,7 @@ pub struct RouteBuilder<In> {
 impl<In: GlaconRecord> RouteBuilder<In> {
     /// Add an input. `name` identifies it in logs and metrics, and to the
     /// input itself through its context, so keep it stable.
-    pub fn input(mut self, name: impl Into<String>, input: impl GlaconCoreInputInit<In>) -> Self {
+    pub fn input(mut self, name: impl Into<String>, input: impl GlaconCoreInput<In>) -> Self {
         self.inputs.push((name.into(), Box::new(input)));
         self
     }
@@ -81,7 +81,7 @@ impl<In: GlaconRecord> RouteBuilder<In> {
     pub fn output(
         self,
         name: impl Into<String>,
-        output: impl GlaconCoreOutputInit<In>,
+        output: impl GlaconCoreOutput<In>,
     ) -> RouteOutputs<In, In> {
         self.middleware(Passthrough).output(name, output)
     }
@@ -92,18 +92,14 @@ impl<In: GlaconRecord> RouteBuilder<In> {
 pub struct RouteOutputs<In, Out> {
     route: RouteBuilder<In>,
     middleware: MiddlewareFactory<In, Out>,
-    outputs: Vec<(String, Box<dyn GlaconCoreOutputInit<Out>>)>,
+    outputs: Vec<(String, Box<dyn InitOutput<Out>>)>,
 }
 
 impl<In: GlaconRecord, Out: GlaconRecord> RouteOutputs<In, Out> {
     /// Add an output. It gets every record of every batch, and keeps what it
     /// wants. `name` identifies it in logs and metrics, and in the ledger, so
     /// keep it stable.
-    pub fn output(
-        mut self,
-        name: impl Into<String>,
-        output: impl GlaconCoreOutputInit<Out>,
-    ) -> Self {
+    pub fn output(mut self, name: impl Into<String>, output: impl GlaconCoreOutput<Out>) -> Self {
         self.outputs.push((name.into(), Box::new(output)));
         self
     }
@@ -186,14 +182,14 @@ mod tests {
 
     struct In;
     #[async_trait::async_trait]
-    impl GlaconCoreInputInit<()> for In {
-        async fn init(self: Box<Self>, _: &InputContext) -> Result<InitializedInput<()>, BoxError> {
-            Ok(InitializedInput::new(*self))
-        }
-    }
-    #[async_trait::async_trait]
     impl GlaconCoreInput<()> for In {
-        async fn next_batch(&mut self) -> Result<Option<Batch<()>>, BoxError> {
+        type State = ();
+
+        async fn init(&mut self, _: &InputContext) -> Result<InitializedInput<()>, BoxError> {
+            Ok(InitializedInput::new(()))
+        }
+
+        async fn next_batch(&mut self, _: &mut ()) -> Result<Option<Batch<()>>, BoxError> {
             Ok(None)
         }
     }
@@ -201,17 +197,14 @@ mod tests {
     /// Writes any record type.
     struct Out;
     #[async_trait::async_trait]
-    impl<R: GlaconRecord> GlaconCoreOutputInit<R> for Out {
-        async fn init(
-            self: Box<Self>,
-            _: &OutputContext,
-        ) -> Result<InitializedOutput<R>, BoxError> {
-            Ok(InitializedOutput::new(*self))
-        }
-    }
-    #[async_trait::async_trait]
     impl<R: GlaconRecord> GlaconCoreOutput<R> for Out {
-        async fn handle_data(&mut self, _: &BatchId, _: &[R]) -> Result<(), BoxError> {
+        type State = ();
+
+        async fn init(&mut self, _: &OutputContext) -> Result<InitializedOutput<()>, BoxError> {
+            Ok(InitializedOutput::new(()))
+        }
+
+        async fn handle_data(&mut self, _: &mut (), _: &BatchId, _: &[R]) -> Result<(), BoxError> {
             Ok(())
         }
     }

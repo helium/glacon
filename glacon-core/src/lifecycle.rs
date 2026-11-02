@@ -7,9 +7,9 @@
 //!
 //! | Before `init` | After `init` |
 //! |---|---|
-//! | [`PendingInput`](crate::input::PendingInput) | [`RouteInput`](crate::input::RouteInput) (the running input) |
+//! | [`PendingInput`](crate::input::PendingInput) | [`RouteInput`](crate::input::RouteInput) (the input with its state) |
 //! | [`RouteMiddleware`](crate::processor::RouteMiddleware) | the same |
-//! | [`PendingOutput`](crate::output::PendingOutput) | [`RouteOutput`](crate::output::RouteOutput) (the running output) |
+//! | [`PendingOutput`](crate::output::PendingOutput) | [`RouteOutput`](crate::output::RouteOutput) (the output with its state) |
 
 use crate::Result;
 use futures::future;

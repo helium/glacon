@@ -7,7 +7,7 @@ mod task;
 mod r#trait;
 
 pub use context::OutputContext;
-pub use r#trait::{GlaconCoreOutput, GlaconCoreOutputInit, InitializedOutput};
+pub use r#trait::{GlaconCoreOutput, InitializedOutput};
 
 pub(crate) use delivery::{BatchTicket, Delivery};
-pub(crate) use task::{PendingOutput, RouteOutput, run};
+pub(crate) use task::{InitOutput, PendingOutput, RouteOutput, run};

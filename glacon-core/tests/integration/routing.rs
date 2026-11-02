@@ -3,8 +3,8 @@
 
 use crate::common::{self, End, Journal, MemoryInput, MemoryOutput, batch, event};
 use glacon_core::{
-    BatchId, BoxError, GlaconCoreMiddleware, GlaconCoreOutput, GlaconCoreOutputInit,
-    InitializedOutput, OutputContext, Route, async_trait,
+    BatchId, BoxError, GlaconCoreMiddleware, GlaconCoreOutput, InitializedOutput, OutputContext,
+    Route, async_trait,
 };
 use std::{
     collections::{HashMap, HashSet},
@@ -120,18 +120,19 @@ impl VerifiedOutput {
 }
 
 #[async_trait]
-impl GlaconCoreOutputInit<Verified> for VerifiedOutput {
-    async fn init(
-        self: Box<Self>,
-        _: &OutputContext,
-    ) -> Result<InitializedOutput<Verified>, BoxError> {
-        Ok(InitializedOutput::new(*self))
-    }
-}
-
-#[async_trait]
 impl GlaconCoreOutput<Verified> for VerifiedOutput {
-    async fn handle_data(&mut self, _: &BatchId, records: &[Verified]) -> Result<(), BoxError> {
+    type State = ();
+
+    async fn init(&mut self, _: &OutputContext) -> Result<InitializedOutput<()>, BoxError> {
+        Ok(InitializedOutput::new(()))
+    }
+
+    async fn handle_data(
+        &mut self,
+        _: &mut (),
+        _: &BatchId,
+        records: &[Verified],
+    ) -> Result<(), BoxError> {
         let mut rows = self.rows.lock().unwrap_or_else(PoisonError::into_inner);
         for record in records {
             match (self.invalid, record.invalid_reason) {

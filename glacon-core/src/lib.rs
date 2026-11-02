@@ -8,13 +8,14 @@
 //!
 //! This crate knows nothing of where records come from or go to. You
 //! provide:
-//! - a [`GlaconCoreInputInit`] per input, initialized into a
-//!   [`GlaconCoreInput`] that produces [`Batch`]es of records;
+//! - a [`GlaconCoreInput`] per input, producing [`Batch`]es of records;
 //! - optionally a [`GlaconCoreMiddleware`]: the records of a batch → the
 //!   records the outputs get, possibly of another type, without the ones to
 //!   drop (default: [`Passthrough`]);
-//! - a [`GlaconCoreOutputInit`] per output, initialized into a
-//!   [`GlaconCoreOutput`] that writes the records it keeps.
+//! - a [`GlaconCoreOutput`] per output, writing the records it keeps.
+//!
+//! Inputs and outputs are their configuration: the route calls their `init`
+//! once, which builds the `State` every later call gets.
 //!
 //! Each route keeps a ledger, `<state_dir>/state.db` (see [`RouteSettings`]),
 //! of the batches it read and the outputs that took them: after a crash, a
@@ -33,11 +34,9 @@ mod route;
 mod task;
 
 pub use error::{BoxError, Error, Result};
-pub use input::{
-    Batch, BatchId, GlaconCoreInput, GlaconCoreInputInit, InitializedInput, InputContext,
-};
+pub use input::{Batch, BatchId, GlaconCoreInput, InitializedInput, InputContext};
 pub use ledger::{InputLedger, Ledger, STATE_DB};
-pub use output::{GlaconCoreOutput, GlaconCoreOutputInit, InitializedOutput, OutputContext};
+pub use output::{GlaconCoreOutput, InitializedOutput, OutputContext};
 pub use processor::middleware::{GlaconCoreMiddleware, MiddlewareContext, Passthrough};
 pub use record::GlaconRecord;
 pub use route::{FreshState, Route, RouteBuilder, RouteOutputs, RouteSettings};

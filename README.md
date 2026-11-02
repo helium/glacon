@@ -107,21 +107,22 @@ then `terminate`.
 
 | Stage | `init` | main hook | `terminate` |
 |---|---|---|---|
-| input | `GlaconCoreInputInit::init(self, ctx)`: connect, build a poller, …; resume from `ctx.ledger()`; returns the running `GlaconCoreInput` and an optional background task (`InitializedInput`) | `GlaconCoreInput::next_batch()`: the next `Batch`, or `None` when done | — (the running input is dropped) |
+| input | `GlaconCoreInput::init(&mut self, ctx)`: connect, build a poller, …; resume from `ctx.ledger()`; returns its `State` and an optional background task (`InitializedInput`) | `GlaconCoreInput::next_batch(&mut state)`: the next `Batch`, or `None` when done | — (the input and its state are dropped) |
 | middleware | `GlaconCoreMiddleware::init(&mut self, ctx)`: open a connection, … | `handle_data(&BatchId, Vec<In>) -> Vec<Out>`: transform the records, leaving out the ones to drop | release |
-| output | `GlaconCoreOutputInit::init(self, ctx)`: connect, create the table, …; returns the running `GlaconCoreOutput`, an optional background task, and whether the destination already holds data (`InitializedOutput::with_existing_data`) | `GlaconCoreOutput::handle_data(&BatchId, &[R])`: gets every record of the batch, writes the ones it keeps, `Ok` once durable. Optional: `already_written(&BatchId)`, asked on replays | `GlaconCoreOutput::terminate`: flush |
+| output | `GlaconCoreOutput::init(&mut self, ctx)`: connect, create the table, …; returns its `State`, an optional background task, and whether the destination already holds data (`InitializedOutput::with_existing_data`) | `GlaconCoreOutput::handle_data(&mut state, &BatchId, &[R])`: gets every record of the batch, writes the ones it keeps, `Ok` once durable. Optional: `already_written(&mut state, &BatchId)`, asked on replays | `GlaconCoreOutput::terminate(&mut state)`: flush |
 
-An input's or output's `init` **consumes** its configuration (what you gave
-the builder, a `GlaconCoreInputInit` / `GlaconCoreOutputInit`) and returns
-the running `GlaconCoreInput` / `GlaconCoreOutput` its task drives, so that
+Inputs and outputs are **one trait each**, implemented by their
+configuration (what you give the builder). `init` builds the stage's
+`State` (a plain struct: connections, channels, writers), and every later
+call gets both the configuration (`&mut self`) and that state, so the state
 holds only what exists once started: no `Option` fields, no "not
-initialized" case. `FileStoreInput` and `IcebergOutput` keep their running
-types private (`RunningFileStoreInput` / `RunningIcebergOutput`). A stage
-with nothing to set up implements both traits and returns itself:
-`Ok(InitializedInput::new(*self))`.
+initialized" case. `FileStoreInput` keeps its files receiver in a
+`FileStoreState`, `IcebergOutput` its writer in an `IcebergState`. A stage
+with nothing to set up has `type State = ()` and returns
+`Ok(InitializedInput::new(()))`.
 
 The middleware's `init` and `terminate` default to doing nothing, as does
-the running output's `terminate`. The `*Context` handed to `init` names the
+the output's `terminate`. The `*Context` handed to `init` names the
 route and the stage, and an input's gives it its view of the ledger. Any
 `Send + Sync + 'static` type is a record (`GlaconRecord`).
 
@@ -132,8 +133,8 @@ every time the input produces that batch (an S3 key, for example).
 ### Background tasks
 
 An input's or output's `init` adds a task, an oracles `ManagedTask`, when it
-needs work running beside it: a poller feeding the running input, a writer
-committing the output's rows (`InitializedInput::new(running).with_task(poller)`).
+needs work running beside it: a poller feeding the input's state, a writer
+committing the output's rows (`InitializedInput::new(state).with_task(poller)`).
 Several tasks can be bundled into one `TaskManager`. The route supervises it:
 
 - it is started before its stage and stopped after it: an input's task stops
