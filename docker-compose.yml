@@ -3,7 +3,7 @@
 # Adapted from helium/oracles; every config file is inlined below.
 #
 #   docker compose up -d --wait
-#   cargo test
+#   cargo nextest run --workspace
 
 services:
   postgres:

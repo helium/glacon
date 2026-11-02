@@ -505,3 +505,10 @@ glacon-helium's integration tests run at once against the shared Polaris.
 The test environment (`glacon-helium/tests/integration/common/harness.rs`)
 gives each test its own Iceberg catalog, buckets, spool and state
 directories.
+
+CI (`.github/workflows/CI.yml`) runs fmt, clippy with the docs, and every
+test of the workspace in a single job against the same services. Each job
+runs in the `base` image of the `Dockerfile` (the Rust toolchain, `protoc`,
+`cargo-nextest`, the AWS CLI), built once per `Dockerfile` and
+`rust-toolchain.toml` and cached in the repository's GitHub container
+registry; nothing else is built or published.
