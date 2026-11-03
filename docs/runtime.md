@@ -73,8 +73,8 @@ background task always starts before its stage and stops after it.
 | `serde::Serialize` of your `Row` | writer | when rows are converted to Arrow |
 | `terminate` of middlewares and outputs | its own task | when it stops (the route task when undoing a failed start) |
 
-`GlaconInput::decode`, `GlaconOutput::table` / `to_rows` and the middleware
-factory are synchronous; the `GlaconCore*` hooks are async.
+`GlaconInput::decode`, `GlaconOutput::table` / `to_rows` and the middleware's
+`Clone` are synchronous; the `GlaconCore*` hooks are async.
 
 ## The life of a record
 
@@ -89,7 +89,7 @@ code.
 | 2 | Init every output at once: connect the catalog, `GlaconOutput::table()` (yours), create namespace and table if missing, report whether the table already had a snapshot | async (HTTP) | route | `lifecycle.rs` `init_all`, `output/iceberg/output.rs` `init` |
 | 3 | `BatchedWriter::new`, spooling to `<spool_dir>/events/lake`; return its task | sync | route | `IcebergOutput::init` |
 | 4 | Fresh-state guard: a ledger never run on, with an output that has data, refuses to start (unless `FreshState::Proceed`); then mark the ledger initialized | async (disk) | route | `route/mod.rs` `guard_fresh_state` |
-| 5 | Per input: run the middleware factory (yours), then every middleware's `init` (yours) at once | sync + async | route | `up` |
+| 5 | Per input: clone your middleware, then every middleware's `init` (yours) at once | sync + async | route | `up` |
 | 6 | Init every input at once: connect the bucket, create the poller, load its resume point from the ledger (the oldest `in_flight` file, else the newest done one) | async (S3 + disk) | route | `input/file_store/input.rs` `init`, `file_store/state.rs` |
 | 7 | Return the poller as the input's background task | sync | route | `FileStoreInput::init` |
 | 8 | Wire the channels; start the route's TaskManager: writer, output, processor, poller, input tasks | sync (spawn) | route | `route/mod.rs` `wire` |
