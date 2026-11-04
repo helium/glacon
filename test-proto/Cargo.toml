@@ -10,3 +10,7 @@ prost.workspace = true
 
 [build-dependencies]
 prost-build = "0.14"
+
+# prost is used by the generated code, included from OUT_DIR: invisible to shear.
+[package.metadata.cargo-shear]
+ignored = ["prost"]

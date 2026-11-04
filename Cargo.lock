@@ -2177,7 +2177,6 @@ dependencies = [
  "tempfile",
  "tokio",
  "tracing",
- "tracing-subscriber",
  "triggered",
  "trino-rust-client",
 ]
