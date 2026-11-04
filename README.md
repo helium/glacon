@@ -21,5 +21,13 @@ cargo nextest run --workspace
 ```
 
 Each crate's README says more about its tests. CI
-(`.github/workflows/CI.yml`) runs fmt, clippy with the docs, and every test,
-in the `base` image of the `Dockerfile`.
+(`.github/workflows/CI.yml`) runs fmt, clippy with the docs, every test, and
+the dependency checks, in the `base` image of the `Dockerfile`:
+
+```bash
+cargo deny check   # advisories, licenses, sources: deny.toml
+cargo shear        # unused dependencies
+```
+
+TruffleHog, Semgrep and zizmor (for `.github/`) scan every PR, and Dependabot
+proposes action and crate updates weekly.
