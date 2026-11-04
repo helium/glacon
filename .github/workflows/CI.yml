@@ -7,18 +7,22 @@ on:
     branches: ["main"]
   workflow_dispatch:
 
+# Every job pulls the base image; only build-base pushes it.
 permissions:
   contents: read
-  packages: write
+  packages: read
 
 jobs:
   compute-base-build-tag:
     runs-on: ubuntu-latest
+    timeout-minutes: 5
     outputs:
       image_tag: ${{ steps.out.outputs.tag }}
     steps:
       - name: Checkout Repository
         uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
+        with:
+          persist-credentials: false
       - name: Create Tag
         id: out
         run: echo "tag=${{ hashFiles('Dockerfile','rust-toolchain.toml') }}" >> "$GITHUB_OUTPUT"
@@ -28,12 +32,18 @@ jobs:
   build-base:
     needs: compute-base-build-tag
     runs-on: ubuntu-latest
+    timeout-minutes: 30
+    permissions:
+      contents: read
+      packages: write
     env:
       CACHE_HIT: false
       IMAGE: ghcr.io/${{ github.repository }}/base:${{ needs.compute-base-build-tag.outputs.image_tag }}
     steps:
       - name: Checkout Repository
         uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
+        with:
+          persist-credentials: false
       - name: Log in to GitHub Container Registry
         uses: docker/login-action@b45d80f862d83dbcd57f89517bcf500b2ab88fb2 # v4
         with:
@@ -63,6 +73,7 @@ jobs:
   fmt:
     needs: [compute-base-build-tag, build-base]
     runs-on: ubuntu-latest
+    timeout-minutes: 10
     container:
       image: ghcr.io/${{ github.repository }}/base:${{ needs.compute-base-build-tag.outputs.image_tag }}
       options: --user 1001:1001
@@ -72,12 +83,15 @@ jobs:
     steps:
       - name: Checkout Repository
         uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
+        with:
+          persist-credentials: false
       - name: Check formatting
         run: cargo fmt --all -- --check
 
   clippy:
     needs: [compute-base-build-tag, build-base]
     runs-on: ubuntu-latest
+    timeout-minutes: 30
     container:
       image: ghcr.io/${{ github.repository }}/base:${{ needs.compute-base-build-tag.outputs.image_tag }}
       options: --user 1001:1001
@@ -87,6 +101,8 @@ jobs:
     steps:
       - name: Checkout Repository
         uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
+        with:
+          persist-credentials: false
       - name: Cache Cargo Target Directory
         uses: actions/cache@668228422ae6a00e4ad889ee87cd7109ec5666a7 # v5
         with:
@@ -101,11 +117,33 @@ jobs:
           RUSTDOCFLAGS: -D warnings
         run: cargo doc --workspace --no-deps --locked
 
+  # Advisories, licenses and sources (deny.toml), and unused dependencies.
+  dependencies:
+    needs: [compute-base-build-tag, build-base]
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    container:
+      image: ghcr.io/${{ github.repository }}/base:${{ needs.compute-base-build-tag.outputs.image_tag }}
+      options: --user 1001:1001
+    concurrency:
+      group: ${{ github.workflow }}-${{ github.ref }}-dependencies
+      cancel-in-progress: true
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
+        with:
+          persist-credentials: false
+      - name: cargo deny
+        run: cargo deny --locked check
+      - name: cargo shear
+        run: cargo shear
+
   # Every test of the workspace in one job, against the services
   # docker-compose.yml runs locally.
   tests:
     needs: [compute-base-build-tag, build-base]
     runs-on: ubuntu-latest
+    timeout-minutes: 45
     container:
       image: ghcr.io/${{ github.repository }}/base:${{ needs.compute-base-build-tag.outputs.image_tag }}
       options: --user 1001:1001
@@ -147,6 +185,8 @@ jobs:
     steps:
       - name: Checkout Repository
         uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
+        with:
+          persist-credentials: false
 
       - name: Cache Cargo Target Directory
         uses: actions/cache@668228422ae6a00e4ad889ee87cd7109ec5666a7 # v5
@@ -190,4 +230,11 @@ jobs:
           CATALOG_QUALIFIED_HOST: polaris
           CATALOG_LOCAL_HOST: polaris
           TRINO_HOST: trino
-        run: cargo nextest run --workspace --locked --no-fail-fast
+        run: cargo nextest run --workspace --locked --profile ci
+
+      - name: Upload JUnit report
+        if: ${{ !cancelled() }}
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: junit
+          path: target/nextest/ci/junit.xml
