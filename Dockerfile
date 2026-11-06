@@ -29,6 +29,19 @@ RUN case "$(uname -m)" in aarch64) platform=linux-arm ;; *) platform=linux ;; es
     && curl -LsSf "https://get.nexte.st/${NEXTEST_VERSION}/${platform}" \
     | tar zxf - -C "${CARGO_HOME}/bin"
 
+# cargo-deny (advisories, licenses, sources: deny.toml) and cargo-shear
+# (unused dependencies), prebuilt.
+ARG CARGO_DENY_VERSION=0.20.2
+ARG CARGO_SHEAR_VERSION=1.14.0
+RUN target="$(uname -m)-unknown-linux-musl" \
+    && mkdir /tmp/tools \
+    && curl -LsSf "https://github.com/EmbarkStudios/cargo-deny/releases/download/${CARGO_DENY_VERSION}/cargo-deny-${CARGO_DENY_VERSION}-${target}.tar.gz" \
+    | tar zxf - -C /tmp/tools \
+    && curl -LsSf "https://github.com/Boshen/cargo-shear/releases/download/v${CARGO_SHEAR_VERSION}/cargo-shear-${target}.tar.gz" \
+    | tar zxf - -C /tmp/tools \
+    && find /tmp/tools -type f \( -name cargo-deny -o -name cargo-shear \) -exec install -m 755 {} "${CARGO_HOME}/bin/" \; \
+    && rm -rf /tmp/tools
+
 # AWS CLI: creates the bucket the test catalogs store their tables in.
 RUN curl -sSf "https://awscli.amazonaws.com/awscli-exe-linux-$(uname -m).zip" -o /tmp/awscliv2.zip \
     && unzip -q /tmp/awscliv2.zip -d /tmp \
