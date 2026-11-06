@@ -9,11 +9,13 @@ targets = [
   "aarch64-apple-darwin",
 ]
 
-# Security advisories (RustSec): vulnerable, unmaintained or unsound crates,
-# and yanked versions, fail the check. A finding to accept goes in `ignore`,
-# with why.
+# Security advisories (RustSec): vulnerable or unsound crates, and yanked
+# versions, fail the check. A finding to accept goes in `ignore`, with why.
 [advisories]
 yanked = "deny"
+# Unmaintained crates fail only when the workspace depends on them directly:
+# the ones deep in the oracles / AWS / iceberg stack have no fix we can make.
+unmaintained = "workspace"
 # Each one comes through oracles (file-store, helium-iceberg) and needs a
 # release there, or upstream, to go away. Drop the line once it does: cargo
 # deny warns about ignores that no longer match.
@@ -31,7 +33,6 @@ ignore = [
   { id = "RUSTSEC-2026-0194", reason = "quick-xml 0.37 / 0.38, via opendal and reqsign (helium-iceberg)" },
   { id = "RUSTSEC-2026-0195", reason = "quick-xml 0.37 / 0.38, via opendal and reqsign (helium-iceberg)" },
   { id = "RUSTSEC-2026-0435", reason = "thrift 0.17, via parquet (helium-iceberg)" },
-  { id = "RUSTSEC-2024-0436", reason = "paste is unmaintained, no fix exists; via iceberg and parquet (helium-iceberg)" },
 ]
 
 # Permissive licenses only. A crate offering a choice (MIT OR Apache-2.0) passes
