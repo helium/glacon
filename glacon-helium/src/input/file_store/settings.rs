@@ -4,7 +4,7 @@ use std::time::Duration;
 
 /// One S3 bucket feeding a route.
 #[derive(Debug, Clone, Deserialize)]
-pub struct InputSettings {
+pub struct FileStoreInputSettings {
     pub bucket: file_store::BucketSettings,
 
     /// Files at or before this time are ignored. Also the starting point on
@@ -28,7 +28,7 @@ pub struct InputSettings {
     pub idle_timeout: Option<Duration>,
 }
 
-impl InputSettings {
+impl FileStoreInputSettings {
     pub fn new(bucket: file_store::BucketSettings, start_after: DateTime<Utc>) -> Self {
         Self {
             bucket,
@@ -46,7 +46,7 @@ mod tests {
 
     #[test]
     fn input_settings_parse_humantime() -> anyhow::Result<()> {
-        let s: InputSettings = serde_json::from_str(
+        let s: FileStoreInputSettings = serde_json::from_str(
             r#"{
                 "bucket": {"bucket": "b"},
                 "start_after": "2026-01-01T00:00:00Z",

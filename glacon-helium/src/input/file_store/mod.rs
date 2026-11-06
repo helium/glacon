@@ -10,5 +10,5 @@ mod r#trait;
 
 pub use file_meta::FileMeta;
 pub use input::{FileStoreInput, FileStoreState};
-pub use settings::InputSettings;
+pub use settings::FileStoreInputSettings;
 pub use r#trait::GlaconInput;

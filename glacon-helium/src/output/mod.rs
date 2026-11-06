@@ -2,4 +2,4 @@
 
 mod iceberg;
 
-pub use iceberg::{GlaconOutput, IcebergOutput, IcebergState, OutputSettings};
+pub use iceberg::{GlaconOutput, IcebergOutput, IcebergOutputSettings, IcebergState};

@@ -3,9 +3,9 @@ use glacon_core::GlaconRecord;
 
 /// Turns the protobuf messages of one kind of file into the route's record.
 ///
-/// The bucket an input reads from is given by its `InputSettings` when it is
-/// wrapped in a [`FileStoreInput`](super::FileStoreInput); the same
-/// `GlaconInput` can therefore be used for several buckets.
+/// The bucket an input reads from is given by its `FileStoreInputSettings`
+/// when it is wrapped in a [`FileStoreInput`](super::FileStoreInput); the
+/// same `GlaconInput` can therefore be used for several buckets.
 pub trait GlaconInput: Send + Sync + 'static {
     /// Message type stored (length-delimited, gzipped) in the files.
     type Proto: prost::Message + Default + Clone + Send + Sync + 'static;

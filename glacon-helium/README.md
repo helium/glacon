@@ -9,13 +9,13 @@ you implement:
 
 | You implement | Wrapped by | Does |
 |---|---|---|
-| `GlaconInput` | `FileStoreInput::new(input, InputSettings)` | One kind of file: file prefix + protobuf message → record. Returning `None` drops the message (logged at error, counted). |
-| `GlaconOutput` | `IcebergOutput::new(output, OutputSettings)` | One table: its definition + record → 0..n rows. It gets every record: no rows drops one. |
+| `GlaconInput` | `FileStoreInput::new(input, FileStoreInputSettings)` | One kind of file: file prefix + protobuf message → record. Returning `None` drops the message (logged at error, counted). |
+| `GlaconOutput` | `IcebergOutput::new(output, IcebergOutputSettings)` | One table: its definition + record → 0..n rows. It gets every record: no rows drops one. |
 
 Everything from glacon-core is re-exported, as are `file_store` and
-`helium_iceberg`, so apps depend on this crate alone. `InputSettings` and
-`OutputSettings` are serde-ready so apps can embed them in their own
-configuration.
+`helium_iceberg`, so apps depend on this crate alone.
+`FileStoreInputSettings` and `IcebergOutputSettings` are serde-ready so apps
+can embed them in their own configuration.
 
 ## Usage
 
@@ -88,7 +88,7 @@ key; its messages are decoded by your `GlaconInput`.
   skips the files that were. Files stay in their bucket, so a file is read
   again after a crash until it is done.
 
-`InputSettings`:
+`FileStoreInputSettings`:
 
 | Field | Default | |
 |---|---|---|
@@ -115,7 +115,7 @@ Writes one table with `helium_iceberg`'s `BatchedWriter`; your
 - Tables must be partitioned: `helium_iceberg` cannot write to an
   unpartitioned table. Schema changes are not handled.
 
-`OutputSettings`:
+`IcebergOutputSettings`:
 
 | Field | Default | |
 |---|---|---|

@@ -1,4 +1,4 @@
-use super::{GlaconOutput, OutputSettings};
+use super::{GlaconOutput, IcebergOutputSettings};
 use crate::metrics;
 use glacon_core::{
     BatchId, BoxError, GlaconCoreOutput, GlaconRecord, InitializedOutput, OutputContext,
@@ -24,11 +24,11 @@ use helium_iceberg::{BatchedWriter, BatchedWriterConfig};
 /// ```
 pub struct IcebergOutput<O> {
     output: O,
-    settings: OutputSettings,
+    settings: IcebergOutputSettings,
 }
 
 impl<O> IcebergOutput<O> {
-    pub fn new(output: O, settings: OutputSettings) -> Self {
+    pub fn new(output: O, settings: IcebergOutputSettings) -> Self {
         Self { output, settings }
     }
 }

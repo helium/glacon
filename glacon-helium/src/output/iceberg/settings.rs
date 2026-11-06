@@ -3,7 +3,7 @@ use std::{path::PathBuf, time::Duration};
 
 /// One Iceberg table a route writes to.
 #[derive(Debug, Clone, Deserialize)]
-pub struct OutputSettings {
+pub struct IcebergOutputSettings {
     pub catalog: helium_iceberg::Settings,
 
     /// Durable directory for the rows written but not committed yet. Each
@@ -20,7 +20,7 @@ pub struct OutputSettings {
     pub batch_timeout: Duration,
 }
 
-impl OutputSettings {
+impl IcebergOutputSettings {
     pub fn new(catalog: helium_iceberg::Settings, spool_dir: impl Into<PathBuf>) -> Self {
         Self {
             catalog,

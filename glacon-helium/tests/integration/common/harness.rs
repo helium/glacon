@@ -7,7 +7,8 @@
 use chrono::{DateTime, Utc};
 use file_store::{BucketSettings, aws_local::AwsLocal};
 use glacon_helium::{
-    InputSettings, Ledger, OutputSettings, RouteSettings, file_store, helium_iceberg,
+    FileStoreInputSettings, IcebergOutputSettings, Ledger, RouteSettings, file_store,
+    helium_iceberg,
 };
 use helium_iceberg::IcebergTestHarness;
 use std::time::Duration;
@@ -83,9 +84,13 @@ impl Harness {
 
     /// Input settings for `bucket`: polls every 100ms and stops after 2s
     /// without new files, so routes end on their own.
-    pub fn input_settings(&self, bucket: usize, start_after: DateTime<Utc>) -> InputSettings {
+    pub fn input_settings(
+        &self,
+        bucket: usize,
+        start_after: DateTime<Utc>,
+    ) -> FileStoreInputSettings {
         let bucket = &self.buckets[bucket];
-        InputSettings {
+        FileStoreInputSettings {
             bucket: BucketSettings {
                 bucket: bucket.bucket().to_string(),
                 settings: file_store::Settings {
@@ -105,8 +110,8 @@ impl Harness {
     /// Output settings writing to this harness's catalog, spooling under its
     /// own directory (stable for the life of the harness, so a route can be
     /// restarted on it).
-    pub fn output_settings(&self) -> OutputSettings {
-        OutputSettings {
+    pub fn output_settings(&self) -> IcebergOutputSettings {
+        IcebergOutputSettings {
             catalog: self.iceberg.as_settings(),
             spool_dir: self.spool_root.path().to_path_buf(),
             max_batch_rows: 10_000,

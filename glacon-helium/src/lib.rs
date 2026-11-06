@@ -16,8 +16,8 @@ pub mod metrics;
 mod output;
 
 pub use glacon_core::*;
-pub use input::{FileMeta, FileStoreInput, FileStoreState, GlaconInput, InputSettings};
-pub use output::{GlaconOutput, IcebergOutput, IcebergState, OutputSettings};
+pub use input::{FileMeta, FileStoreInput, FileStoreInputSettings, FileStoreState, GlaconInput};
+pub use output::{GlaconOutput, IcebergOutput, IcebergOutputSettings, IcebergState};
 
 // Re-exported so apps can name these types without matching versions.
 pub use file_store;

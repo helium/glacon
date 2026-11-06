@@ -3,8 +3,8 @@
 
 use crate::common;
 use glacon_helium::{
-    FileStoreInput, FreshState, IcebergOutput, InputSettings, OutputSettings, Route, RouteSettings,
-    metrics as m,
+    FileStoreInput, FileStoreInputSettings, FreshState, IcebergOutput, IcebergOutputSettings,
+    Route, RouteSettings, metrics as m,
     task_manager::{ManagedTask, TaskManager},
 };
 use glacon_test_proto::event_v2::Kind as V2Kind;
@@ -408,8 +408,8 @@ const RECORDS_PER_FILE: usize = 20;
 /// The route the crash test kills and restarts.
 fn crash_route(
     route_settings: RouteSettings,
-    input: InputSettings,
-    output: OutputSettings,
+    input: FileStoreInputSettings,
+    output: IcebergOutputSettings,
 ) -> anyhow::Result<Route<common::Event>> {
     Ok(Route::builder(CRASH_ROUTE, route_settings)
         .input("v1", FileStoreInput::new(common::V1Input, input))
@@ -527,9 +527,9 @@ async fn a_killed_route_loses_nothing_on_restart() -> anyhow::Result<()> {
     Ok(())
 }
 
-/// `InputSettings` as JSON, credentials included (file_store skips them
-/// when serializing).
-fn input_json(s: &InputSettings) -> Value {
+/// `FileStoreInputSettings` as JSON, credentials included (file_store skips
+/// them when serializing).
+fn input_json(s: &FileStoreInputSettings) -> Value {
     let bucket = &s.bucket.settings;
     json!({
         "bucket": {
@@ -544,9 +544,9 @@ fn input_json(s: &InputSettings) -> Value {
     })
 }
 
-/// `OutputSettings` as JSON, credentials included (helium_iceberg skips them
-/// when serializing).
-fn output_json(s: &OutputSettings) -> anyhow::Result<Value> {
+/// `IcebergOutputSettings` as JSON, credentials included (helium_iceberg
+/// skips them when serializing).
+fn output_json(s: &IcebergOutputSettings) -> anyhow::Result<Value> {
     let mut catalog = serde_json::to_value(&s.catalog)?;
     catalog["auth"]["token"] = json!(s.catalog.auth.token);
     catalog["auth"]["credential"] = json!(s.catalog.auth.credential);

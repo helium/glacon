@@ -1,5 +1,5 @@
 use super::{
-    FileMeta, GlaconInput, InputSettings,
+    FileMeta, FileStoreInputSettings, GlaconInput,
     state::{LedgerState, NoRecord},
 };
 use crate::metrics;
@@ -22,11 +22,11 @@ use tokio::sync::mpsc;
 /// ```
 pub struct FileStoreInput<I> {
     input: I,
-    settings: InputSettings,
+    settings: FileStoreInputSettings,
 }
 
 impl<I: GlaconInput> FileStoreInput<I> {
-    pub fn new(input: I, settings: InputSettings) -> Self {
+    pub fn new(input: I, settings: FileStoreInputSettings) -> Self {
         Self { input, settings }
     }
 }
