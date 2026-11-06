@@ -1834,7 +1834,7 @@ dependencies = [
 [[package]]
 name = "file-store"
 version = "0.1.0"
-source = "git+https://github.com/helium/oracles?branch=main#78a2c2c7184737954149c1dcfbe1b5a8cd4d59cc"
+source = "git+https://github.com/helium/oracles?branch=main#c0c6b36c7b8f7a2775c7f3e20f0382f51796a25f"
 dependencies = [
  "async-compression",
  "async-trait",
@@ -2326,7 +2326,7 @@ checksum = "2304e00983f87ffb38b55b444b5e3b60a884b5d30c0fca7d82fe33449bbe55ea"
 [[package]]
 name = "helium-iceberg"
 version = "0.1.0"
-source = "git+https://github.com/helium/oracles?branch=main#78a2c2c7184737954149c1dcfbe1b5a8cd4d59cc"
+source = "git+https://github.com/helium/oracles?branch=main#c0c6b36c7b8f7a2775c7f3e20f0382f51796a25f"
 dependencies = [
  "arrow-array",
  "arrow-ipc",
@@ -3800,7 +3800,7 @@ checksum = "b4596b6d070b27117e987119b4dac604f3c58cfb0b191112e24771b2faeac1a6"
 [[package]]
 name = "poc-metrics"
 version = "0.1.0"
-source = "git+https://github.com/helium/oracles?branch=main#78a2c2c7184737954149c1dcfbe1b5a8cd4d59cc"
+source = "git+https://github.com/helium/oracles?branch=main#c0c6b36c7b8f7a2775c7f3e20f0382f51796a25f"
 dependencies = [
  "futures",
  "metrics",
@@ -4008,7 +4008,7 @@ dependencies = [
  "quinn-udp",
  "rustc-hash",
  "rustls 0.23.46",
- "socket2 0.5.10",
+ "socket2 0.6.5",
  "thiserror 2.0.21",
  "tokio",
  "tracing",
@@ -4047,7 +4047,7 @@ dependencies = [
  "cfg_aliases",
  "libc",
  "once_cell",
- "socket2 0.5.10",
+ "socket2 0.6.5",
  "tracing",
  "windows-sys 0.61.2",
 ]
@@ -5346,7 +5346,7 @@ checksum = "7b2093cf4c8eb1e67749a6762251bc9cd836b6fc171623bd0a9d324d37af2417"
 [[package]]
 name = "task-manager"
 version = "0.1.0"
-source = "git+https://github.com/helium/oracles?branch=main#78a2c2c7184737954149c1dcfbe1b5a8cd4d59cc"
+source = "git+https://github.com/helium/oracles?branch=main#c0c6b36c7b8f7a2775c7f3e20f0382f51796a25f"
 dependencies = [
  "futures",
  "futures-util",
@@ -5363,7 +5363,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "32497e9a4c7b38532efcdebeef879707aa9f794296a4f0244f6f69e9bc8574bd"
 dependencies = [
  "fastrand",
- "getrandom 0.3.4",
+ "getrandom 0.4.3",
  "once_cell",
  "rustix",
  "windows-sys 0.61.2",
@@ -5487,7 +5487,7 @@ checksum = "fd3ca314f692efd6c868f8408f53fe444634a845f96c028b97d35f6a1f79f0ee"
 [[package]]
 name = "tls-init"
 version = "0.1.0"
-source = "git+https://github.com/helium/oracles?branch=main#78a2c2c7184737954149c1dcfbe1b5a8cd4d59cc"
+source = "git+https://github.com/helium/oracles?branch=main#c0c6b36c7b8f7a2775c7f3e20f0382f51796a25f"
 dependencies = [
  "ctor",
  "hyper-rustls 0.27.10",
@@ -6135,7 +6135,7 @@ version = "0.1.11"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c2a7b1c03c876122aa43f3020e6c3c3ee5c05081c9a00739faf7503aeba10d22"
 dependencies = [
- "windows-sys 0.48.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
