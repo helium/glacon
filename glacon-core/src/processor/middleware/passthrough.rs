@@ -1,14 +1,18 @@
 use super::GlaconCoreMiddleware;
-use crate::{BatchId, BoxError, GlaconRecord};
+use crate::{BatchId, BoxError, GlaconRecord, RecordResult};
 
-/// Default middleware: records pass unchanged.
+/// Default middleware: every record passes unchanged, as `Ok`.
 #[derive(Debug, Default, Clone, Copy)]
 pub struct Passthrough;
 
 #[async_trait::async_trait]
 impl<R: GlaconRecord> GlaconCoreMiddleware<R, R> for Passthrough {
-    async fn handle_data(&mut self, _batch: &BatchId, records: Vec<R>) -> Result<Vec<R>, BoxError> {
-        Ok(records)
+    async fn handle_data(
+        &mut self,
+        _batch: &BatchId,
+        records: Vec<R>,
+    ) -> Result<Vec<RecordResult<R>>, BoxError> {
+        Ok(records.into_iter().map(Ok).collect())
     }
 }
 
@@ -23,7 +27,10 @@ mod tests {
             key: "k".to_string(),
             timestamp: chrono::Utc::now(),
         };
-        assert_eq!(Passthrough.handle_data(&batch, vec![1, 2]).await?, [1, 2]);
+        assert_eq!(
+            Passthrough.handle_data(&batch, vec![1, 2]).await?,
+            [Ok(1), Ok(2)]
+        );
         Ok(())
     }
 }

@@ -1,6 +1,7 @@
 //! Fixtures shared by the integration tests: one record type fed by two
 //! inputs with different protobuf messages, two outputs with different row
-//! types, and a middleware dropping one kind of record.
+//! types, a table of the middleware's errors, and a middleware rejecting one
+//! kind of record.
 
 pub mod harness;
 pub mod metrics;
@@ -10,7 +11,7 @@ pub use harness::Harness;
 use chrono::{DateTime, Duration, Utc};
 use glacon_helium::{
     BatchId, BoxError, FileMeta, FileStoreInput, GlaconCoreMiddleware, GlaconInput, GlaconOutput,
-    IcebergOutput, Route, RouteBuilder, RouteOutputs, async_trait,
+    IcebergOutput, RecordResult, Route, RouteBuilder, RouteOutputs, async_trait,
     helium_iceberg::{FieldDefinition, PartitionDefinition, TableDefinition},
     task_manager::ManagedTask,
 };
@@ -22,6 +23,7 @@ pub const V1_PREFIX: &str = "event_v1";
 pub const V2_PREFIX: &str = "event_v2";
 pub const EVENTS: &str = "events";
 pub const VALUES: &str = "values";
+pub const REJECTS: &str = "rejects";
 
 // ---------------------------------------------------------------- record
 
@@ -226,22 +228,58 @@ impl<T: GlaconOutput<Event>> GlaconOutput<Event> for Only<T> {
     }
 }
 
+/// One row per error of the middleware; no row for its records.
+pub struct RejectsTable(pub &'static str);
+
+#[derive(Serialize)]
+pub struct RejectRow {
+    error: String,
+    rejected_at: DateTime<Utc>,
+}
+
+impl GlaconOutput<Event> for RejectsTable {
+    type Row = RejectRow;
+
+    fn table(&self) -> glacon_helium::helium_iceberg::Result<TableDefinition> {
+        TableDefinition::builder("default", self.0)
+            .with_fields([
+                FieldDefinition::required_string("error"),
+                FieldDefinition::required_timestamptz("rejected_at"),
+            ])
+            .with_partition(PartitionDefinition::day("rejected_at", "rejected_at_day"))
+            .build()
+    }
+
+    fn to_rows(&self, _: &Event, _: &mut Vec<RejectRow>) {}
+
+    fn to_error_rows(&self, error: &str, rows: &mut Vec<RejectRow>) {
+        rows.push(RejectRow {
+            error: error.to_string(),
+            rejected_at: Utc::now(),
+        });
+    }
+}
+
 // ---------------------------------------------------------------- middleware
 
-/// Drops "drop" events (no output gets them); the rest pass unchanged.
+/// Rejects "drop" events (outputs get an error for each); the rest pass
+/// unchanged.
 #[derive(Clone)]
-pub struct DropKind;
+pub struct RejectDrop;
 
 #[async_trait]
-impl GlaconCoreMiddleware<Event, Event> for DropKind {
+impl GlaconCoreMiddleware<Event, Event> for RejectDrop {
     async fn handle_data(
         &mut self,
         _: &BatchId,
         events: Vec<Event>,
-    ) -> Result<Vec<Event>, BoxError> {
+    ) -> Result<Vec<RecordResult<Event>>, BoxError> {
         Ok(events
             .into_iter()
-            .filter(|e| e.kind != Kind::Drop)
+            .map(|e| match e.kind {
+                Kind::Drop => Err(format!("{}: rejected", e.id)),
+                _ => Ok(e),
+            })
             .collect())
     }
 }
@@ -349,6 +387,29 @@ pub async fn values(harness: &Harness, table: &str) -> anyhow::Result<Vec<ValueO
         ))
         .await?
         .into_vec())
+}
+
+#[derive(Debug, serde::Deserialize, serde::Serialize, Trino)]
+struct RejectOut {
+    error: String,
+}
+
+/// The errors of a rejects table, sorted.
+pub async fn rejects(harness: &Harness, table: &str) -> anyhow::Result<Vec<String>> {
+    if count(harness, table).await? == 0 {
+        return Ok(Vec::new());
+    }
+    Ok(harness
+        .iceberg
+        .trino()
+        .get_all::<RejectOut>(format!(
+            "SELECT error FROM \"default\".{table} ORDER BY error"
+        ))
+        .await?
+        .into_vec()
+        .into_iter()
+        .map(|r| r.error)
+        .collect())
 }
 
 pub fn ids(events: &[EventOut]) -> Vec<&str> {

@@ -1,9 +1,11 @@
-//! Deduplication as a middleware: a record seen in one batch is dropped from
-//! every other batch, across inputs, within a batch, and across a crash, where
-//! a replayed batch keeps the records it claimed.
+//! Deduplication as a middleware: a record seen in one batch is a duplicate
+//! in every other batch, across inputs, within a batch, and across a crash,
+//! where a replayed batch keeps the records it claimed.
 
 use crate::common::{self, End, Journal, MemoryInput, MemoryOutput, batch, event};
-use glacon_core::{BatchId, BoxError, Error, GlaconCoreMiddleware, Route, async_trait};
+use glacon_core::{
+    BatchId, BoxError, Error, GlaconCoreMiddleware, RecordResult, Route, async_trait,
+};
 use std::{
     collections::{HashMap, HashSet},
     sync::{Arc, Mutex, PoisonError},
@@ -32,6 +34,10 @@ async fn deduplication_is_a_middleware() -> anyhow::Result<()> {
     common::run(route).await?;
 
     assert_eq!(output.rows(), ["a", "b", "c"]);
+    assert_eq!(
+        output.errors(),
+        ["a: duplicate", "b: duplicate", "c: duplicate"]
+    );
     Ok(())
 }
 
@@ -58,10 +64,10 @@ async fn deduplication_keeps_a_replayed_batch() -> anyhow::Result<()> {
         .await
         .expect_err("the output fails");
     assert!(matches!(common::route_error(&err), Error::Output { .. }));
-    assert!(output.rows().is_empty());
+    assert!(output.batches().is_empty());
 
-    // us.1 is replayed and keeps what it claimed; us.2 is new, and only c
-    // is its own.
+    // us.1 is replayed and keeps what it claimed, not calling its own
+    // records duplicates; us.2 is new, and only c is its own.
     common::run(route(vec![
         file("us.1", &["a", "b", "a"]),
         file("us.2", &["a", "c"]),
@@ -69,20 +75,21 @@ async fn deduplication_keeps_a_replayed_batch() -> anyhow::Result<()> {
     .await?;
 
     assert_eq!(output.rows(), ["a", "b", "c"]);
+    assert_eq!(output.errors(), ["a: duplicate", "a: duplicate"]);
     assert_eq!(output.batches(), ["us.1", "us.2"]);
     common::assert_nothing_in_flight(state.path(), "replay").await
 }
 
 // ---------------------------------------------------------------- helpers
 
-/// Deduplication is a middleware dropping duplicates: every processor gets
+/// Deduplication is a middleware rejecting duplicates: every processor gets
 /// its own instance, sharing what was seen through an Arc.
 ///
 /// Replay-safe: a batch read again after a crash must give the same
-/// records, so each id remembers the batch that claimed it, and a record
-/// whose id this same batch claimed is kept. (A real one would keep this in
-/// a store, like the ledger.) A batch is its input and key, as in the
-/// ledger: its timestamp may differ when it is produced again.
+/// results, so each id remembers the batch that claimed it, and a record
+/// whose id this same batch claimed is still `Ok`. (A real one would keep
+/// this in a store, like the ledger.) A batch is its input and key, as in
+/// the ledger: its timestamp may differ when it is produced again.
 #[derive(Clone, Default)]
 struct Dedup {
     claimed_by: Arc<Mutex<HashMap<String, Claimer>>>,
@@ -97,7 +104,7 @@ impl GlaconCoreMiddleware<common::Event, common::Event> for Dedup {
         &mut self,
         batch: &BatchId,
         events: Vec<common::Event>,
-    ) -> Result<Vec<common::Event>, BoxError> {
+    ) -> Result<Vec<RecordResult<common::Event>>, BoxError> {
         let mut claimed_by = self
             .claimed_by
             .lock()
@@ -106,11 +113,15 @@ impl GlaconCoreMiddleware<common::Event, common::Event> for Dedup {
         let mut in_batch = HashSet::new();
         Ok(events
             .into_iter()
-            .filter(|e| {
+            .map(|e| {
                 let claimer = claimed_by
                     .entry(e.id.clone())
                     .or_insert_with(|| this.clone());
-                *claimer == this && in_batch.insert(e.id.clone())
+                if *claimer == this && in_batch.insert(e.id.clone()) {
+                    Ok(e)
+                } else {
+                    Err(format!("{}: duplicate", e.id))
+                }
             })
             .collect())
     }

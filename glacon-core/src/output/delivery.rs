@@ -1,13 +1,14 @@
-use crate::{BatchId, Result, ledger::InputLedger};
+use crate::{BatchId, RecordResult, Result, ledger::InputLedger};
 use std::sync::{
     Arc,
     atomic::{AtomicUsize, Ordering},
 };
 
-/// One batch handed to an output: its records, shared by every output.
+/// One batch handed to an output: what the middleware made of its records,
+/// shared by every output.
 pub(crate) struct Delivery<R> {
     pub ticket: Arc<BatchTicket>,
-    pub records: Arc<Vec<R>>,
+    pub records: Arc<Vec<RecordResult<R>>>,
 }
 
 /// One batch on its way to its outputs, shared by their deliveries. Each

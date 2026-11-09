@@ -2,6 +2,7 @@ use super::{GlaconOutput, IcebergOutputSettings};
 use crate::metrics;
 use glacon_core::{
     BatchId, BoxError, GlaconCoreOutput, GlaconRecord, InitializedOutput, OutputContext,
+    RecordResult,
 };
 use helium_iceberg::{BatchedWriter, BatchedWriterConfig};
 
@@ -80,18 +81,21 @@ where
             .with_existing_data(has_data))
     }
 
-    /// Turn the records into rows and queue them; returns once they are in
-    /// the spool. Records without rows are the ones this table drops: a
-    /// batch with none at all queues nothing.
+    /// Turn the records, and the middleware's errors, into rows and queue
+    /// them; returns once they are in the spool. Records without rows are
+    /// the ones this table drops: a batch with none at all queues nothing.
     async fn handle_data(
         &mut self,
         state: &mut Self::State,
         _: &BatchId,
-        records: &[R],
+        records: &[RecordResult<R>],
     ) -> Result<(), BoxError> {
         let mut rows = Vec::new();
         for record in records {
-            self.output.to_rows(record, &mut rows);
+            match record {
+                Ok(record) => self.output.to_rows(record, &mut rows),
+                Err(error) => self.output.to_error_rows(error, &mut rows),
+            }
         }
         if rows.is_empty() {
             return Ok(());

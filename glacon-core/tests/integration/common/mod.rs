@@ -10,7 +10,7 @@ use chrono::Utc;
 use glacon_core::{
     Batch, BatchId, BoxError, Error, GlaconCoreInput, GlaconCoreMiddleware, GlaconCoreOutput,
     InitializedInput, InitializedOutput, InputContext, Ledger, MiddlewareContext, OutputContext,
-    Route, RouteBuilder, RouteOutputs, RouteSettings, async_trait,
+    RecordResult, Route, RouteBuilder, RouteOutputs, RouteSettings, async_trait,
     task_manager::{self, ManagedTask, TaskError, TaskFuture, TaskResult},
 };
 use std::{
@@ -32,7 +32,7 @@ pub const RIGHT: &str = "right";
 #[derive(Debug, Clone)]
 pub struct Event {
     pub id: String,
-    /// "left", "right" or "both" (which [`MemoryOutput`]s keep it), "drop"
+    /// "left", "right" or "both" (which [`MemoryOutput`]s keep it), "reject"
     /// or "fail" (see [`Checked`]).
     pub kind: &'static str,
 }
@@ -313,14 +313,16 @@ impl GlaconCoreInput<Event> for ChannelInput {
 
 // ---------------------------------------------------------------- output
 
-/// Keeps the ids of the events whose kind is its name or "both", and the
-/// batches it was handed. Clones share them, so a test keeps one to read
+/// Keeps the ids of the events whose kind is its name or "both", the
+/// middleware's errors, and the batches it was handed. Clones share them, so a test keeps one to read
 /// what the route wrote, and a restarted route writes to the same rows. It
 /// reports existing data from `init` when it already has rows.
 #[derive(Clone)]
 pub struct MemoryOutput {
     pub name: &'static str,
     rows: Arc<Mutex<Vec<String>>>,
+    /// The middleware's errors it was handed.
+    errors: Arc<Mutex<Vec<String>>>,
     /// Keys of the batches handed to it, in order.
     batches: Arc<Mutex<Vec<String>>>,
     /// Writes left to fail before writing.
@@ -341,6 +343,7 @@ impl MemoryOutput {
         Self {
             name,
             rows: Default::default(),
+            errors: Default::default(),
             batches: Default::default(),
             failing_writes: Default::default(),
             failing_after_writes: Default::default(),
@@ -379,6 +382,17 @@ impl MemoryOutput {
             .clone();
         rows.sort();
         rows
+    }
+
+    /// The middleware's errors it was handed, sorted.
+    pub fn errors(&self) -> Vec<String> {
+        let mut errors = self
+            .errors
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .clone();
+        errors.sort();
+        errors
     }
 
     /// Resolves once at least `n` rows were written.
@@ -428,20 +442,22 @@ impl GlaconCoreOutput<Event> for MemoryOutput {
         &mut self,
         _: &mut (),
         batch: &BatchId,
-        records: &[Event],
+        records: &[RecordResult<Event>],
     ) -> Result<(), BoxError> {
         if take_one(&self.failing_writes) {
             return Err(format!("{} write failure", self.name).into());
         }
-        self.rows
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
-            .extend(
-                records
-                    .iter()
-                    .filter(|e| e.kind == self.name || e.kind == "both")
-                    .map(|e| e.id.clone()),
-            );
+        {
+            let mut rows = self.rows.lock().unwrap_or_else(PoisonError::into_inner);
+            let mut errors = self.errors.lock().unwrap_or_else(PoisonError::into_inner);
+            for record in records {
+                match record {
+                    Ok(e) if e.kind == self.name || e.kind == "both" => rows.push(e.id.clone()),
+                    Ok(_) => {}
+                    Err(error) => errors.push(error.clone()),
+                }
+            }
+        }
         self.batches
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
@@ -470,7 +486,8 @@ impl GlaconCoreOutput<Event> for MemoryOutput {
 
 // ---------------------------------------------------------------- middleware
 
-/// Drops "drop" events and fails on "fail" ones; the rest pass unchanged.
+/// Rejects "reject" events and fails on "fail" ones; the rest pass
+/// unchanged.
 #[derive(Clone)]
 pub struct Checked {
     pub input: String,
@@ -489,11 +506,17 @@ impl GlaconCoreMiddleware<Event, Event> for Checked {
         &mut self,
         _: &BatchId,
         events: Vec<Event>,
-    ) -> Result<Vec<Event>, BoxError> {
+    ) -> Result<Vec<RecordResult<Event>>, BoxError> {
         if events.iter().any(|e| e.kind == "fail") {
             return Err("middleware failure".into());
         }
-        Ok(events.into_iter().filter(|e| e.kind != "drop").collect())
+        Ok(events
+            .into_iter()
+            .map(|e| match e.kind {
+                "reject" => Err(format!("{}: rejected", e.id)),
+                _ => Ok(e),
+            })
+            .collect())
     }
 
     async fn terminate(&mut self) -> Result<(), BoxError> {
