@@ -9,10 +9,11 @@
 //! This crate knows nothing of where records come from or go to. You
 //! provide:
 //! - a [`GlaconCoreInput`] per input, producing [`Batch`]es of records;
-//! - optionally a [`GlaconCoreMiddleware`]: the records of a batch → the
-//!   records the outputs get, possibly of another type, without the ones to
-//!   drop (default: [`Passthrough`]);
-//! - a [`GlaconCoreOutput`] per output, writing the records it keeps.
+//! - optionally a [`GlaconCoreMiddleware`]: the records of a batch → one
+//!   [`RecordResult`] per record, the record the outputs get (possibly of
+//!   another type) or why it failed (default: [`Passthrough`]);
+//! - a [`GlaconCoreOutput`] per output, writing the records it keeps and
+//!   handling the failures as it wants.
 //!
 //! Inputs and outputs are their configuration: the route calls their `init`
 //! once, which builds the `State` every later call gets.
@@ -38,7 +39,7 @@ pub use input::{Batch, BatchId, GlaconCoreInput, InitializedInput, InputContext}
 pub use ledger::{InputLedger, Ledger, STATE_DB};
 pub use output::{GlaconCoreOutput, InitializedOutput, OutputContext};
 pub use processor::middleware::{GlaconCoreMiddleware, MiddlewareContext, Passthrough};
-pub use record::GlaconRecord;
+pub use record::{GlaconRecord, RecordResult};
 pub use route::{FreshState, Route, RouteBuilder, RouteOutputs, RouteSettings};
 
 // Re-exported so inputs, outputs and middlewares can be implemented, and

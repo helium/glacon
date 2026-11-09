@@ -220,9 +220,10 @@ async fn the_ledger_records_each_file_done() -> anyhow::Result<()> {
     let second = h
         .put_file(b, common::V1_PREFIX, ts, vec![common::v1("b", "drop", 1)])
         .await?;
-    // The middleware drops "drop" records: the second file goes nowhere.
+    // The middleware rejects "drop" records: the second file only gives an
+    // error, which neither table keeps.
     let route = common::input_builder(&h, "ledger", b)
-        .middleware(common::DropKind)
+        .middleware(common::RejectDrop)
         .output(
             common::EVENTS,
             IcebergOutput::new(common::EventsTable("events"), h.output_settings()),
@@ -236,7 +237,7 @@ async fn the_ledger_records_each_file_done() -> anyhow::Result<()> {
 
     let ledger = h.ledger("ledger").await?;
     assert!(!ledger.is_fresh().await?);
-    // Done even when every record was dropped.
+    // Done even when every record was rejected.
     assert!(ledger.is_done("v1", &first).await?);
     assert!(ledger.is_done("v1", &second).await?);
     assert_eq!(ledger.in_flight("v1").await?, 0);

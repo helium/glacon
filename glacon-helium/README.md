@@ -10,7 +10,7 @@ you implement:
 | You implement | Wrapped by | Does |
 |---|---|---|
 | `GlaconInput` | `FileStoreInput::new(input, FileStoreInputSettings)` | One kind of file: file prefix + protobuf message → record. Returning `None` drops the message (logged at error, counted). |
-| `GlaconOutput` | `IcebergOutput::new(output, IcebergOutputSettings)` | One table: its definition + record → 0..n rows. It gets every record: no rows drops one. |
+| `GlaconOutput` | `IcebergOutput::new(output, IcebergOutputSettings)` | One table: its definition + record → 0..n rows (`to_rows`), and middleware error → 0..n rows (`to_error_rows`, default none). It gets every result: no rows drops one. |
 
 Everything from glacon-core is re-exported, as are `file_store` and
 `helium_iceberg`, so apps depend on this crate alone.
@@ -22,7 +22,7 @@ can embed them in their own configuration.
 The middleware of [glacon-core's example](../glacon-core/README.md#usage)
 decides once whether a speed test is valid. Here each bucket is a
 `FileStoreInput`, and each table an `IcebergOutput` keeping what it wants:
-valid tests in one, invalid ones in the other.
+valid tests in one, the middleware's errors in the other.
 
 ```rust
 use glacon_helium::{
@@ -56,19 +56,33 @@ impl GlaconOutput<VerifiedSpeedTest> for VerifiedTable {
     }
 
     fn to_rows(&self, t: &VerifiedSpeedTest, rows: &mut Vec<VerifiedRow>) {
-        if t.invalid_reason.is_none() {
-            rows.push(VerifiedRow::from(&t.test));
-        }
+        rows.push(VerifiedRow::from(&t.0));
+    }
+    // to_error_rows: the default, none.
+}
+
+struct RejectedTable;
+
+impl GlaconOutput<VerifiedSpeedTest> for RejectedTable {
+    type Row = RejectedRow;
+
+    fn table(&self) -> helium_iceberg::Result<TableDefinition> {
+        // namespace, name, schema, partitioning
+    }
+
+    fn to_rows(&self, _: &VerifiedSpeedTest, _: &mut Vec<RejectedRow>) {}
+
+    fn to_error_rows(&self, error: &str, rows: &mut Vec<RejectedRow>) {
+        rows.push(RejectedRow::new(error));
     }
 }
-// DroppedTable keeps the tests whose invalid_reason is set, with the reason.
 
 let route = Route::builder("speedtests", RouteSettings::new("/data/speedtests"))
     .input("us", FileStoreInput::new(SpeedTestInput, us_settings))
     .input("eu", FileStoreInput::new(SpeedTestInput, eu_settings))
     .middleware(VerifySpeedTest)
     .output("verified", IcebergOutput::new(VerifiedTable, verified_settings))
-    .output("dropped", IcebergOutput::new(DroppedTable, dropped_settings))
+    .output("rejected", IcebergOutput::new(RejectedTable, rejected_settings))
     .build()?;
 
 TaskManager::builder().add_task(route).build().start().await?;

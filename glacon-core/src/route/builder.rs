@@ -177,7 +177,7 @@ mod tests {
     use super::*;
     use crate::{
         Batch, BatchId, BoxError, GlaconCoreInput, GlaconCoreOutput, InitializedInput,
-        InitializedOutput, InputContext, OutputContext,
+        InitializedOutput, InputContext, OutputContext, RecordResult,
     };
 
     struct In;
@@ -204,7 +204,12 @@ mod tests {
             Ok(InitializedOutput::new(()))
         }
 
-        async fn handle_data(&mut self, _: &mut (), _: &BatchId, _: &[R]) -> Result<(), BoxError> {
+        async fn handle_data(
+            &mut self,
+            _: &mut (),
+            _: &BatchId,
+            _: &[RecordResult<R>],
+        ) -> Result<(), BoxError> {
             Ok(())
         }
     }
@@ -218,8 +223,8 @@ mod tests {
             &mut self,
             _: &BatchId,
             records: Vec<()>,
-        ) -> Result<Vec<u32>, BoxError> {
-            Ok((0..records.len() as u32).collect())
+        ) -> Result<Vec<RecordResult<u32>>, BoxError> {
+            Ok((0..records.len() as u32).map(Ok).collect())
         }
     }
 
