@@ -1,16 +1,14 @@
 //! The middleware: records from N inputs, transformed by each input's
 //! middleware (changing their type, dropping some), then kept or not by each
-//! of M outputs; a failing middleware fails the route.
+//! of M outputs; a failing middleware fails the route. Deduplication has its
+//! own file, `middleware_dedup.rs`.
 
 use crate::common::{self, End, Journal, MemoryInput, MemoryOutput, batch, event};
 use glacon_core::{
     BatchId, BoxError, Error, GlaconCoreMiddleware, GlaconCoreOutput, InitializedOutput,
     OutputContext, Route, async_trait,
 };
-use std::{
-    collections::{HashMap, HashSet},
-    sync::{Arc, Mutex, PoisonError},
-};
+use std::sync::{Arc, Mutex, PoisonError};
 
 // ---------------------------------------------------------------- transforming
 
@@ -63,6 +61,104 @@ async fn routes_records_to_outputs() -> anyhow::Result<()> {
     assert_eq!(right.rows(), ["b1", "b2", "r1"]);
     Ok(())
 }
+
+#[tokio::test]
+async fn a_middleware_can_change_the_record_type() -> anyhow::Result<()> {
+    let state = tempfile::tempdir()?;
+    let journal = Journal::default();
+    let input = MemoryInput::new(
+        "us",
+        vec![batch(
+            "us.1",
+            vec![
+                event("fast1", "both"),
+                event("slow1", "both"),
+                event("broken", "drop"),
+                event("fast2", "both"),
+            ],
+        )],
+        End::Return,
+        &journal,
+    );
+    let (verified, invalid) = (VerifiedOutput::new(false), VerifiedOutput::new(true));
+
+    let route = Route::builder("verify", common::settings(state.path(), "verify"))
+        .input("us", input)
+        .middleware(Verify)
+        .output("verified", verified.clone())
+        .output("invalid", invalid.clone())
+        .build()?;
+    common::run(route).await?;
+
+    assert_eq!(verified.rows(), ["fast1", "fast2"]);
+    assert_eq!(invalid.rows(), ["slow1: too slow"]);
+    Ok(())
+}
+
+// ---------------------------------------------------------------- dropping and failing
+
+#[tokio::test]
+async fn a_batch_the_middleware_empties_is_done() -> anyhow::Result<()> {
+    let state = tempfile::tempdir()?;
+    let journal = Journal::default();
+    let (left, right) = common::outputs(&journal);
+    let input = MemoryInput::new(
+        "us",
+        vec![batch("us.1", vec![event("x", "drop")])],
+        End::Return,
+        &journal,
+    );
+
+    let route = common::route(
+        "dropped",
+        state.path(),
+        vec![input],
+        &left,
+        &right,
+        &journal,
+    )
+    .build()?;
+    common::run(route).await?;
+
+    assert!(left.batches().is_empty() && right.batches().is_empty());
+    let ledger = common::ledger(state.path(), "dropped").await?;
+    assert!(ledger.is_done("us", "us.1").await?);
+    common::assert_nothing_in_flight(state.path(), "dropped").await
+}
+
+#[tokio::test]
+async fn a_failing_middleware_fails_the_route() -> anyhow::Result<()> {
+    let state = tempfile::tempdir()?;
+    let journal = Journal::default();
+    let (left, right) = common::outputs(&journal);
+    let input = MemoryInput::new(
+        "us",
+        vec![batch("us.1", vec![event("x", "fail")])],
+        End::HoldOpen,
+        &journal,
+    );
+
+    let route = common::route(
+        "middleware",
+        state.path(),
+        vec![input],
+        &left,
+        &right,
+        &journal,
+    )
+    .build()?;
+    let err = common::run(route).await.expect_err("must fail");
+
+    let err = common::route_error(&err);
+    assert!(
+        matches!(err, Error::Middleware { input, .. } if input == "us"),
+        "{err}"
+    );
+    common::assert_down_order(&journal);
+    Ok(())
+}
+
+// ---------------------------------------------------------------- helpers
 
 /// A speed test once verified: the middleware decides, every output sees
 /// the result and keeps what it wants.
@@ -146,160 +242,4 @@ impl GlaconCoreOutput<Verified> for VerifiedOutput {
         }
         Ok(())
     }
-}
-
-#[tokio::test]
-async fn a_middleware_can_change_the_record_type() -> anyhow::Result<()> {
-    let state = tempfile::tempdir()?;
-    let journal = Journal::default();
-    let input = MemoryInput::new(
-        "us",
-        vec![batch(
-            "us.1",
-            vec![
-                event("fast1", "both"),
-                event("slow1", "both"),
-                event("broken", "drop"),
-                event("fast2", "both"),
-            ],
-        )],
-        End::Return,
-        &journal,
-    );
-    let (verified, invalid) = (VerifiedOutput::new(false), VerifiedOutput::new(true));
-
-    let route = Route::builder("verify", common::settings(state.path(), "verify"))
-        .input("us", input)
-        .middleware(Verify)
-        .output("verified", verified.clone())
-        .output("invalid", invalid.clone())
-        .build()?;
-    common::run(route).await?;
-
-    assert_eq!(verified.rows(), ["fast1", "fast2"]);
-    assert_eq!(invalid.rows(), ["slow1: too slow"]);
-    Ok(())
-}
-
-/// Deduplication is a middleware dropping duplicates: every processor gets
-/// its own instance, sharing what was seen through an Arc.
-///
-/// Replay-safe: a batch read again after a crash must give the same
-/// records, so each id remembers the batch that claimed it, and a record
-/// whose id this same batch claimed is kept. (A real one would keep this in
-/// a store, like the ledger.)
-#[derive(Clone, Default)]
-struct Dedup {
-    claimed_by: Arc<Mutex<HashMap<String, BatchId>>>,
-}
-
-#[async_trait]
-impl GlaconCoreMiddleware<common::Event, common::Event> for Dedup {
-    async fn handle_data(
-        &mut self,
-        batch: &BatchId,
-        events: Vec<common::Event>,
-    ) -> Result<Vec<common::Event>, BoxError> {
-        let mut claimed_by = self
-            .claimed_by
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner);
-        let mut in_batch = HashSet::new();
-        Ok(events
-            .into_iter()
-            .filter(|e| {
-                let claimer = claimed_by
-                    .entry(e.id.clone())
-                    .or_insert_with(|| batch.clone());
-                claimer == batch && in_batch.insert(e.id.clone())
-            })
-            .collect())
-    }
-}
-
-#[tokio::test]
-async fn deduplication_is_a_middleware() -> anyhow::Result<()> {
-    let state = tempfile::tempdir()?;
-    let journal = Journal::default();
-    let output = MemoryOutput::new(common::LEFT, &journal);
-    let inputs = [("us", ["a", "b", "a"]), ("eu", ["b", "c", "c"])].map(|(name, ids)| {
-        let events = ids.iter().map(|id| event(id, "both")).collect();
-        MemoryInput::new(name, vec![batch(name, events)], End::Return, &journal)
-    });
-
-    let mut builder = Route::builder("dedup", common::settings(state.path(), "dedup"));
-    for input in inputs {
-        builder = builder.input(input.name, input);
-    }
-    let route = builder
-        .middleware(Dedup::default())
-        .output(common::LEFT, output.clone())
-        .build()?;
-    common::run(route).await?;
-
-    assert_eq!(output.rows(), ["a", "b", "c"]);
-    Ok(())
-}
-
-// ---------------------------------------------------------------- dropping and failing
-
-#[tokio::test]
-async fn a_batch_the_middleware_empties_is_done() -> anyhow::Result<()> {
-    let state = tempfile::tempdir()?;
-    let journal = Journal::default();
-    let (left, right) = common::outputs(&journal);
-    let input = MemoryInput::new(
-        "us",
-        vec![batch("us.1", vec![event("x", "drop")])],
-        End::Return,
-        &journal,
-    );
-
-    let route = common::route(
-        "dropped",
-        state.path(),
-        vec![input],
-        &left,
-        &right,
-        &journal,
-    )
-    .build()?;
-    common::run(route).await?;
-
-    assert!(left.batches().is_empty() && right.batches().is_empty());
-    let ledger = common::ledger(state.path(), "dropped").await?;
-    assert!(ledger.is_done("us", "us.1").await?);
-    common::assert_nothing_in_flight(state.path(), "dropped").await
-}
-
-#[tokio::test]
-async fn a_failing_middleware_fails_the_route() -> anyhow::Result<()> {
-    let state = tempfile::tempdir()?;
-    let journal = Journal::default();
-    let (left, right) = common::outputs(&journal);
-    let input = MemoryInput::new(
-        "us",
-        vec![batch("us.1", vec![event("x", "fail")])],
-        End::HoldOpen,
-        &journal,
-    );
-
-    let route = common::route(
-        "middleware",
-        state.path(),
-        vec![input],
-        &left,
-        &right,
-        &journal,
-    )
-    .build()?;
-    let err = common::run(route).await.expect_err("must fail");
-
-    let err = common::route_error(&err);
-    assert!(
-        matches!(err, Error::Middleware { input, .. } if input == "us"),
-        "{err}"
-    );
-    common::assert_down_order(&journal);
-    Ok(())
 }

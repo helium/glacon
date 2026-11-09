@@ -5,5 +5,6 @@
 mod common;
 mod input;
 mod middleware;
+mod middleware_dedup;
 mod output;
 mod route;

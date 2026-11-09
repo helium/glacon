@@ -18,8 +18,10 @@ use crate::{BatchId, BoxError, GlaconRecord};
 ///
 /// After a crash, a batch that was not done is handled again, and must give
 /// the same records. A middleware keeping state across batches (seen keys,
-/// for example) must be replay safe: key that state by [`BatchId`], so a
-/// record its own batch already claimed is still kept on a replay.
+/// for example) must be replay safe: key that state by the batch's `input`
+/// and `key` (not the whole [`BatchId`], whose timestamp may differ on a
+/// replay), so a record its own batch already claimed is still kept on a
+/// replay.
 #[async_trait::async_trait]
 pub trait GlaconCoreMiddleware<In: GlaconRecord, Out: GlaconRecord>: Send + 'static {
     async fn init(&mut self, _ctx: &MiddlewareContext) -> Result<(), BoxError> {

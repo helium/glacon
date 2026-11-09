@@ -185,7 +185,9 @@ the ledger. Any `Send + Sync + 'static` type is a record (`GlaconRecord`).
 
 `BatchId { input, key, timestamp }` names the batch records came from: the
 input's name, and the `Batch`'s key and timestamp. The key must be the same
-every time the input produces that batch (an S3 key, for example).
+every time the input produces that batch (an S3 key, for example); the
+timestamp may differ. The input and key identify the batch, in the ledger
+and for any state keyed by batch.
 
 ### Background tasks
 
@@ -325,10 +327,15 @@ seen again is delivered again.
 
 On a replay, the middleware sees the batch again, and must give the same
 records. A stateless middleware does. One with state, like a deduplicating
-one, keys it by `&BatchId`: remember which batch claimed each record, and
-keep a record its own batch claimed (see `deduplication_is_a_middleware` in
-`tests/integration/middleware.rs`). Likewise, an output decides what to keep
-from the record alone.
+one, keys it by batch, its input and key (not the whole `BatchId`, whose
+timestamp may differ on a replay): remember which batch claimed each record,
+keep a record its own batch claimed, and drop the others. Save that state
+before `handle_data` returns, and keep it as long as a batch may be produced
+again (`processed_retention`). Without it, a replayed batch would drop its
+own records as duplicates, and the batch, left empty, would be done: those
+records would be lost. See `deduplication_is_a_middleware` and
+`deduplication_keeps_a_replayed_batch` in `tests/integration/middleware_dedup.rs`.
+Likewise, an output decides what to keep from the record alone.
 
 ### Lost state: the fresh-state guard
 
@@ -368,4 +375,6 @@ cargo nextest run -p glacon-core
 ```
 
 `tests/integration` has one file per part of a route (`input.rs`,
-`middleware.rs`, `output.rs`) and one for the route as a whole (`route.rs`).
+`middleware.rs`, `output.rs`), one for the route as a whole (`route.rs`), and
+one for deduplication (`middleware_dedup.rs`). Each file has its tests first,
+then the helpers they use.
