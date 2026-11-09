@@ -33,6 +33,12 @@ ignore = [
   { id = "RUSTSEC-2026-0194", reason = "quick-xml 0.37 / 0.38, via opendal and reqsign (helium-iceberg)" },
   { id = "RUSTSEC-2026-0195", reason = "quick-xml 0.37 / 0.38, via opendal and reqsign (helium-iceberg)" },
   { id = "RUSTSEC-2026-0435", reason = "thrift 0.17, via parquet (helium-iceberg)" },
+  # glacon-core → sqlx (the ledger)
+  # sqlx-sqlite 0.9.0, the latest, caps libsqlite3-sys below 0.38, and the fix
+  # is in 0.39: drop this once a sqlx release allows it. The bug needs a
+  # database and -wal written by a less trusted party; glacon only opens the
+  # state.db it creates and writes itself.
+  { id = "RUSTSEC-2026-0459", reason = "bundled SQLite < 3.54 in libsqlite3-sys 0.30, via sqlx-sqlite 0.9 (ledger); glacon only opens its own state.db" },
 ]
 
 # Permissive licenses only. A crate offering a choice (MIT OR Apache-2.0) passes
