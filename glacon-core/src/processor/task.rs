@@ -61,9 +61,10 @@ pub(crate) struct OutputSender<R> {
 /// (or, on shutdown, until what is queued is handled), then terminate the
 /// middleware.
 ///
-/// Every output gets every batch, and keeps what it wants, except on a
-/// replay the outputs that already have it (the ledger knows which). A batch
-/// the middleware empties, or no output still needs, is done right away;
+/// Every output gets every batch, failures included, and keeps what it
+/// wants, except on a replay the outputs that already have it (the ledger
+/// knows which). An empty batch, or one no output still needs, is done right
+/// away;
 /// otherwise the last output to take it marks it done.
 ///
 /// If the middleware fails or an output is gone, the input is stopped first:
@@ -167,11 +168,22 @@ async fn process<In: GlaconRecord, Out: GlaconRecord>(
         .handle_data(&id, records)
         .await
         .map_err(|e| Error::middleware(route, input, e))?;
-    let dropped = read.saturating_sub(records.len()) as u64;
-    metrics::input_counter(metrics::MIDDLEWARE_DROPPED, route, input, dropped);
+    if records.len() != read {
+        return Err(Error::middleware(
+            route,
+            input,
+            format!(
+                "returned {} results for the {read} records of batch {}",
+                records.len(),
+                id.key
+            ),
+        ));
+    }
+    let errors = records.iter().filter(|r| r.is_err()).count() as u64;
+    metrics::input_counter(metrics::MIDDLEWARE_ERRORS, route, input, errors);
 
     // Every output gets the batch, except, on a replay, those that already
-    // took it. A batch left empty goes to none.
+    // took it. An empty batch goes to none.
     let mut targets: Vec<&OutputSender<Out>> = Vec::new();
     if !records.is_empty() {
         let delivered = if replayed {
@@ -226,7 +238,7 @@ async fn process<In: GlaconRecord, Out: GlaconRecord>(
         input = %input,
         batch = %id.key,
         records = read,
-        dropped,
+        errors,
         outputs = targets.len(),
         replayed,
         "processed batch"

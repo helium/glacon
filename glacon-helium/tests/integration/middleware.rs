@@ -1,10 +1,11 @@
-//! The middleware drops records; each output keeps the kinds it wants.
+//! The middleware rejects records; each output keeps the kinds it wants,
+//! and a rejects table keeps the errors.
 
 use crate::common::{self, Kind, Only};
 use glacon_helium::{FileStoreInput, IcebergOutput, Route, metrics as m};
 
 #[tokio::test]
-async fn outputs_keep_what_they_want_of_what_the_middleware_left() -> anyhow::Result<()> {
+async fn outputs_keep_what_they_want_of_what_the_middleware_made() -> anyhow::Result<()> {
     common::metrics::install()?;
     let mut h = common::Harness::new().await?;
     let b = h.add_bucket().await?;
@@ -26,7 +27,7 @@ async fn outputs_keep_what_they_want_of_what_the_middleware_left() -> anyhow::Re
             "v1",
             FileStoreInput::new(common::V1Input, h.input_settings(b, common::start_after())),
         )
-        .middleware(common::DropKind)
+        .middleware(common::RejectDrop)
         .output(
             common::EVENTS,
             IcebergOutput::new(
@@ -40,6 +41,10 @@ async fn outputs_keep_what_they_want_of_what_the_middleware_left() -> anyhow::Re
                 Only(common::ValuesTable("event_values"), &[Kind::B, Kind::Both]),
                 h.output_settings(),
             ),
+        )
+        .output(
+            common::REJECTS,
+            IcebergOutput::new(common::RejectsTable("rejects"), h.output_settings()),
         )
         .build()?;
 
@@ -55,21 +60,26 @@ async fn outputs_keep_what_they_want_of_what_the_middleware_left() -> anyhow::Re
         .map(|v| v.event_id)
         .collect();
     assert_eq!(value_ids, ["both", "only_values"]);
+    assert_eq!(common::rejects(&h, "rejects").await?, ["nowhere: rejected"]);
 
     let route = [("route", "mw_routes")];
-    assert_eq!(common::metrics::counter(m::MIDDLEWARE_DROPPED, &route)?, 1);
-    for output in [common::EVENTS, common::VALUES] {
+    assert_eq!(common::metrics::counter(m::MIDDLEWARE_ERRORS, &route)?, 1);
+    for (output, kept) in [
+        (common::EVENTS, 2),
+        (common::VALUES, 2),
+        (common::REJECTS, 1),
+    ] {
         let labels = [("route", "mw_routes"), ("output", output)];
-        // Every output is handed what the middleware left...
+        // Every output is handed every result, the error included...
         assert_eq!(
             common::metrics::counter(m::OUTPUT_RECORDS, &labels)?,
-            3,
+            4,
             "{output}"
         );
-        // ...and keeps two of them.
+        // ...and keeps some of them.
         assert_eq!(
             common::metrics::counter(m::OUTPUT_ROWS, &labels)?,
-            2,
+            kept,
             "{output}"
         );
     }

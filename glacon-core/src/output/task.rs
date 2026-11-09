@@ -1,6 +1,6 @@
 use super::{Delivery, GlaconCoreOutput, InitializedOutput, OutputContext};
 use crate::{
-    BatchId, BoxError, Error, GlaconRecord, Result,
+    BatchId, BoxError, Error, GlaconRecord, RecordResult, Result,
     lifecycle::{Initialized, Lifecycle, Terminate},
     metrics,
 };
@@ -33,7 +33,11 @@ pub(crate) trait InitOutput<R>: Send {
 /// Any [`GlaconCoreOutput`] after `init`, holding its state.
 #[async_trait::async_trait]
 pub(crate) trait WriteOutput<R>: Send {
-    async fn handle_data(&mut self, batch: &BatchId, records: &[R]) -> Result<(), BoxError>;
+    async fn handle_data(
+        &mut self,
+        batch: &BatchId,
+        records: &[RecordResult<R>],
+    ) -> Result<(), BoxError>;
     async fn already_written(&mut self, batch: &BatchId) -> Result<bool, BoxError>;
     async fn terminate(&mut self) -> Result<(), BoxError>;
 }
@@ -65,7 +69,11 @@ impl<R: GlaconRecord, O: GlaconCoreOutput<R>> InitOutput<R> for O {
 
 #[async_trait::async_trait]
 impl<R: GlaconRecord, O: GlaconCoreOutput<R>> WriteOutput<R> for Started<O, R> {
-    async fn handle_data(&mut self, batch: &BatchId, records: &[R]) -> Result<(), BoxError> {
+    async fn handle_data(
+        &mut self,
+        batch: &BatchId,
+        records: &[RecordResult<R>],
+    ) -> Result<(), BoxError> {
         self.output
             .handle_data(&mut self.state, batch, records)
             .await

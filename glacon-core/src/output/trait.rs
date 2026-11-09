@@ -1,5 +1,5 @@
 use super::OutputContext;
-use crate::{BatchId, BoxError, GlaconRecord};
+use crate::{BatchId, BoxError, GlaconRecord, RecordResult};
 use task_manager::ManagedTask;
 
 /// An output: writes records somewhere (a table, a topic, ...).
@@ -12,10 +12,12 @@ use task_manager::ManagedTask;
 /// Driven by the output's task for every batch, then terminated once every
 /// processor stopped. An error stops the route.
 ///
-/// An output gets every record of every batch, as the middleware left them,
-/// and keeps what it wants: deciding which records to drop is its job. That
-/// decision must depend on the record alone, so a replayed batch gives the
-/// same result.
+/// An output gets every record of every batch, as the middleware left them:
+/// `Ok` with a record, or `Err` with why the middleware could not make one
+/// (see [`RecordResult`]). It keeps what it wants: deciding which records to
+/// write, and what to do with the failures (write them somewhere, count
+/// them, ignore them), is its job. That decision must depend on the result
+/// alone, so a replayed batch gives the same outcome.
 ///
 /// An output with nothing to set up has `()` as its state:
 ///
@@ -46,15 +48,17 @@ pub trait GlaconCoreOutput<R: GlaconRecord>: Send + 'static {
         ctx: &OutputContext,
     ) -> Result<InitializedOutput<Self::State>, BoxError>;
 
-    /// Write the records of one batch this output keeps (possibly none).
-    /// Return only once they are durable: returning `Ok` is the
-    /// acknowledgement, after which the route never hands this output the
-    /// batch again. An output keeping nothing of a batch still returns `Ok`.
+    /// Write what this output keeps of one batch (possibly nothing): one
+    /// result per record the input read, in order. Return only once it is
+    /// durable: returning `Ok` is the acknowledgement, after which the route
+    /// never hands this output the batch again. An output keeping nothing of
+    /// a batch still returns `Ok`; a record's `Err` is not this output's
+    /// failure, and does not have to fail it.
     async fn handle_data(
         &mut self,
         state: &mut Self::State,
         batch: &BatchId,
-        records: &[R],
+        records: &[RecordResult<R>],
     ) -> Result<(), BoxError>;
 
     /// Whether this output already holds `batch`: asked only when a batch is

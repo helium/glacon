@@ -21,4 +21,10 @@ pub trait GlaconOutput<R>: Send + Sync + 'static {
     /// records this table doesn't keep. Decide from the record alone, so a
     /// replayed batch gives the same rows.
     fn to_rows(&self, record: &R, rows: &mut Vec<Self::Row>);
+
+    /// Append the rows for a record the middleware could not make, given
+    /// why. Default: none, so the table ignores the middleware's errors; a
+    /// rejects table appends a row for them. Decide from the error alone, so
+    /// a replayed batch gives the same rows.
+    fn to_error_rows(&self, _error: &str, _rows: &mut Vec<Self::Row>) {}
 }
