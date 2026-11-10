@@ -1,5 +1,6 @@
-use glacon_core::RecordError;
+use glacon_core::GlaconRecordError;
 use serde::Serialize;
+use std::convert::Infallible;
 
 /// Turns route records into rows of one Iceberg table.
 ///
@@ -8,7 +9,11 @@ use serde::Serialize;
 ///
 /// The table must be partitioned: helium-iceberg's writer cannot write to an
 /// unpartitioned table.
-pub trait GlaconOutput<R>: Send + Sync + 'static {
+///
+/// `E` is the error type of the route's middleware ([`Infallible`] without
+/// one). A table that keeps only records can implement this for any
+/// `E: GlaconRecordError`.
+pub trait GlaconOutput<R, E: GlaconRecordError = Infallible>: Send + Sync + 'static {
     /// Row written to the table; serialized to Arrow through serde, so field
     /// names must match the table's columns.
     type Row: Serialize + Send + Sync + 'static;
@@ -24,9 +29,9 @@ pub trait GlaconOutput<R>: Send + Sync + 'static {
     fn to_rows(&self, record: &R, rows: &mut Vec<Self::Row>);
 
     /// Append the rows for a record the middleware could not make, given
-    /// why (its `reason` category and its `message`). Default: none, so the
+    /// why: the middleware's own error, to match on. Default: none, so the
     /// table ignores the middleware's errors; a rejects table appends a row
     /// for them. Decide from the error alone, so a replayed batch gives the
     /// same rows.
-    fn to_error_rows(&self, _error: &RecordError, _rows: &mut Vec<Self::Row>) {}
+    fn to_error_rows(&self, _error: &E, _rows: &mut Vec<Self::Row>) {}
 }

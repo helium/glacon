@@ -1,17 +1,20 @@
 use super::GlaconCoreMiddleware;
 use crate::{BatchId, BoxError, GlaconRecord, RecordResult};
+use std::convert::Infallible;
 
-/// Default middleware: every record passes unchanged, as `Ok`.
+/// Default middleware: every record passes unchanged, as `Ok`; none fails.
 #[derive(Debug, Default, Clone, Copy)]
 pub struct Passthrough;
 
 #[async_trait::async_trait]
 impl<R: GlaconRecord> GlaconCoreMiddleware<R, R> for Passthrough {
+    type Error = Infallible;
+
     async fn handle_data(
         &mut self,
         _batch: &BatchId,
         records: Vec<R>,
-    ) -> Result<Vec<RecordResult<R>>, BoxError> {
+    ) -> Result<Vec<RecordResult<R, Infallible>>, BoxError> {
         Ok(records.into_iter().map(Ok).collect())
     }
 }

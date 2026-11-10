@@ -11,7 +11,9 @@
 //! - a [`GlaconCoreInput`] per input, producing [`Batch`]es of records;
 //! - optionally a [`GlaconCoreMiddleware`]: the records of a batch → one
 //!   [`RecordResult`] per record, the record the outputs get (possibly of
-//!   another type) or why it failed (default: [`Passthrough`]);
+//!   another type) or why it failed, in the middleware's own
+//!   [`GlaconRecordError`] type (default: [`Passthrough`], which never
+//!   fails);
 //! - a [`GlaconCoreOutput`] per output, writing the records it keeps and
 //!   handling the failures as it wants.
 //!
@@ -39,7 +41,7 @@ pub use input::{Batch, BatchId, GlaconCoreInput, InitializedInput, InputContext}
 pub use ledger::{InputLedger, Ledger, STATE_DB};
 pub use output::{GlaconCoreOutput, InitializedOutput, OutputContext};
 pub use processor::middleware::{GlaconCoreMiddleware, MiddlewareContext, Passthrough};
-pub use record::{GlaconRecord, RecordError, RecordResult};
+pub use record::{GlaconRecord, GlaconRecordError, RecordResult};
 pub use route::{FreshState, Route, RouteBuilder, RouteOutputs, RouteSettings};
 
 // Re-exported so inputs, outputs and middlewares can be implemented, and

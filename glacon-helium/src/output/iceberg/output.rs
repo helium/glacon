@@ -1,8 +1,8 @@
 use super::{GlaconOutput, IcebergOutputSettings};
 use crate::metrics;
 use glacon_core::{
-    BatchId, BoxError, GlaconCoreOutput, GlaconRecord, InitializedOutput, OutputContext,
-    RecordResult,
+    BatchId, BoxError, GlaconCoreOutput, GlaconRecord, GlaconRecordError, InitializedOutput,
+    OutputContext, RecordResult,
 };
 use helium_iceberg::{BatchedWriter, BatchedWriterConfig};
 
@@ -35,10 +35,11 @@ impl<O> IcebergOutput<O> {
 }
 
 #[async_trait::async_trait]
-impl<O, R> GlaconCoreOutput<R> for IcebergOutput<O>
+impl<O, R, E> GlaconCoreOutput<R, E> for IcebergOutput<O>
 where
-    O: GlaconOutput<R>,
+    O: GlaconOutput<R, E>,
     R: GlaconRecord,
+    E: GlaconRecordError,
 {
     type State = IcebergState<O::Row>;
 
@@ -88,7 +89,7 @@ where
         &mut self,
         state: &mut Self::State,
         _: &BatchId,
-        records: &[RecordResult<R>],
+        records: &[RecordResult<R, E>],
     ) -> Result<(), BoxError> {
         let mut rows = Vec::new();
         let mut err_rows = 0;

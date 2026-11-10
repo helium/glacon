@@ -6,9 +6,9 @@ use std::sync::{
 
 /// One batch handed to an output: what the middleware made of its records,
 /// shared by every output.
-pub(crate) struct Delivery<R> {
+pub(crate) struct Delivery<R, E> {
     pub ticket: Arc<BatchTicket>,
-    pub records: Arc<Vec<RecordResult<R>>>,
+    pub records: Arc<Vec<RecordResult<R, E>>>,
 }
 
 /// One batch on its way to its outputs, shared by their deliveries. Each

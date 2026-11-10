@@ -26,7 +26,7 @@ valid tests in one, the middleware's errors in the other.
 
 ```rust
 use glacon_helium::{
-    FileMeta, FileStoreInput, GlaconInput, GlaconOutput, IcebergOutput, RecordError, Route,
+    FileMeta, FileStoreInput, GlaconInput, GlaconOutput, GlaconRecordError, IcebergOutput, Route,
     RouteSettings,
     helium_iceberg::{self, TableDefinition},
     task_manager::TaskManager,
@@ -49,7 +49,8 @@ impl GlaconInput for SpeedTestInput {
 
 struct VerifiedTable;
 
-impl GlaconOutput<VerifiedSpeedTest> for VerifiedTable {
+// Keeps only records: works whatever the middleware's error type.
+impl<E: GlaconRecordError> GlaconOutput<VerifiedSpeedTest, E> for VerifiedTable {
     type Row = VerifiedRow;
 
     fn table(&self) -> helium_iceberg::Result<TableDefinition> {
@@ -64,7 +65,7 @@ impl GlaconOutput<VerifiedSpeedTest> for VerifiedTable {
 
 struct RejectedTable;
 
-impl GlaconOutput<VerifiedSpeedTest> for RejectedTable {
+impl GlaconOutput<VerifiedSpeedTest, VerifyError> for RejectedTable {
     type Row = RejectedRow;
 
     fn table(&self) -> helium_iceberg::Result<TableDefinition> {
@@ -73,8 +74,12 @@ impl GlaconOutput<VerifiedSpeedTest> for RejectedTable {
 
     fn to_rows(&self, _: &VerifiedSpeedTest, _: &mut Vec<RejectedRow>) {}
 
-    fn to_error_rows(&self, error: &RecordError, rows: &mut Vec<RejectedRow>) {
-        rows.push(RejectedRow::new(error.reason, &error.message));
+    fn to_error_rows(&self, error: &VerifyError, rows: &mut Vec<RejectedRow>) {
+        let kbps = match error {
+            VerifyError::TooSlow { kbps, .. } => Some(*kbps),
+            VerifyError::NoLocation { .. } => None,
+        };
+        rows.push(RejectedRow::new(error.reason(), &error.to_string(), kbps));
     }
 }
 
