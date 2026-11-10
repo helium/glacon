@@ -64,10 +64,15 @@ async fn outputs_keep_what_they_want_of_what_the_middleware_made() -> anyhow::Re
 
     let route = [("route", "mw_routes")];
     assert_eq!(common::metrics::counter(m::MIDDLEWARE_ERRORS, &route)?, 1);
-    for (output, kept) in [
-        (common::EVENTS, 2),
-        (common::VALUES, 2),
-        (common::REJECTS, 1),
+    let rejected = [("route", "mw_routes"), ("reason", "rejected")];
+    assert_eq!(
+        common::metrics::counter(m::MIDDLEWARE_ERRORS, &rejected)?,
+        1
+    );
+    for (output, ok_rows, err_rows) in [
+        (common::EVENTS, 2, 0),
+        (common::VALUES, 2, 0),
+        (common::REJECTS, 0, 1),
     ] {
         let labels = [("route", "mw_routes"), ("output", output)];
         // Every output is handed every result, the error included...
@@ -76,12 +81,24 @@ async fn outputs_keep_what_they_want_of_what_the_middleware_made() -> anyhow::Re
             4,
             "{output}"
         );
-        // ...and keeps some of them.
-        assert_eq!(
-            common::metrics::counter(m::OUTPUT_ROWS, &labels)?,
-            kept,
-            "{output}"
-        );
+        for (kind, n) in [("ok", 3), ("err", 1)] {
+            let by_kind = [("route", "mw_routes"), ("output", output), ("kind", kind)];
+            assert_eq!(
+                common::metrics::counter(m::OUTPUT_RECORDS, &by_kind)?,
+                n,
+                "{output} {kind}"
+            );
+        }
+        // ...and keeps some of them, as rows made from records or errors.
+        for (kind, n) in [("ok", ok_rows), ("err", err_rows)] {
+            let by_kind = [("route", "mw_routes"), ("output", output), ("kind", kind)];
+            assert_eq!(
+                common::metrics::counter(m::OUTPUT_ROWS, &by_kind)?,
+                n,
+                "{output} {kind}"
+            );
+        }
+        assert_eq!(common::metrics::counter(m::OUTPUT_BATCHES, &labels)?, 1);
     }
     h.cleanup().await?;
     Ok(())

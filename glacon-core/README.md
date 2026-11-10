@@ -104,7 +104,8 @@ record goes through, from startup to shutdown.
 
 ```rust
 use glacon_core::{
-    BatchId, BoxError, GlaconCoreMiddleware, RecordResult, Route, RouteSettings, async_trait,
+    BatchId, BoxError, GlaconCoreMiddleware, RecordError, RecordResult, Route, RouteSettings,
+    async_trait,
 };
 
 /// What the outputs get for a valid speed test.
@@ -127,7 +128,7 @@ impl GlaconCoreMiddleware<SpeedTest, VerifiedSpeedTest> for VerifySpeedTest {
             .into_iter()
             .map(|test| match test.verify() {
                 None => Ok(VerifiedSpeedTest(test)),
-                Some(reason) => Err(format!("{}: {reason}", test.id)),
+                Some(reason) => Err(RecordError::new("invalid", format!("{}: {reason}", test.id))),
             })
             .collect())
     }
@@ -151,12 +152,17 @@ let route = Route::builder("speedtests", RouteSettings::new("/data/speedtests"))
   processor. Share state between the clones through an `Arc`; create what
   can't be cloned (a connection) in its `init`.
 - **Never drop: `Ok` or `Err`.** The middleware returns exactly one
-  `RecordResult<Out>` (`Result<Out, String>`) per record it got, in order;
-  another count fails the route. A record that can't go on as data
+  `RecordResult<Out>` (`Result<Out, RecordError>`) per record it got, in
+  order; another count fails the route. A record that can't go on as data
   (malformed, a duplicate, invalid) becomes an `Err` saying why, and every
   output gets it: one writes the errors to a rejects table, another counts
   them, another ignores them. The middleware's own failure (its store is
   down) is the outer `Err`, and stops the route.
+- **A `RecordError` has a `reason` and a `message`.** The `reason` is a short
+  category from a fixed set (`"invalid"`, `"duplicate"`, `"malformed"`): it
+  labels `glacon_middleware_errors_total`, so it is a `&'static str`, never
+  built from the record. The `message` says what was wrong with this record;
+  it is logged and handed to the outputs, never a label.
 - Give every route its own `state_dir`. `RouteSettings` is serde-ready
   (`state_dir`, `processed_retention`).
 - `Route` names its tasks `input <name>`, `processor <name>` and
@@ -356,22 +362,51 @@ over on purpose, build it with `.fresh_state(FreshState::Proceed)`.
 ## Metrics
 
 Emitted through the `metrics` facade (the app installs an exporter). Every
-series has a `route` label, plus `input` or `output` where it applies:
+series has a `route` label, plus `input` or `output` where it applies. Times
+and durations are in milliseconds.
 
-- `glacon_processed_batches_total`
-- `glacon_batch_lag_seconds`
-- `glacon_batch_processing_seconds`
-- `glacon_middleware_errors_total`: records the middleware turned into an
-  `Err`
-- `glacon_output_records_total`: results handed to an output, `Ok` and `Err`
-  (it may keep fewer)
-- `glacon_replayed_batches_total`: batches read again after a run that did
-  not finish them
-- `glacon_skipped_deliveries_total`: deliveries skipped because the output
-  already had the batch (from the ledger, or `already_written`)
-- `glacon_in_flight_batches`: batches of an input read but not done (updated
-  hourly)
-- `glacon_state_pruned_total`: done batches forgotten by retention
+| Metric | Type | Labels | What |
+|---|---|---|---|
+| `glacon_processed_batches_total` | counter | `input` | Batches through the middleware and handed to the outputs |
+| `glacon_batch_lag_ms` | gauge | `input` | Batch timestamp to processing, for the batch just processed. Frozen while nothing is processed |
+| `glacon_last_batch_timestamp_ms` | gauge | `input` | Newest batch timestamp processed (Unix ms): `now - this` grows when a route stalls |
+| `glacon_batch_processing_ms` | histogram | `input` | One batch through a processor: middleware, then hand-off |
+| `glacon_middleware_ms` | histogram | `input` | The middleware's part |
+| `glacon_output_handoff_ms` | histogram | `input` | Waiting for the outputs to take the batch: grows when an output is slower than the input |
+| `glacon_middleware_errors_total` | counter | `input`, `reason` | Records the middleware turned into an `Err`, by `RecordError::reason` |
+| `glacon_output_batches_total` | counter | `output` | Batches an output wrote |
+| `glacon_output_records_total` | counter | `output`, `kind` | Results an output wrote: `ok` records, `err` middleware errors (it may keep fewer) |
+| `glacon_output_write_ms` | histogram | `output` | One output's `handle_data` on one batch |
+| `glacon_replayed_batches_total` | counter | `input` | Batches read again after a run that did not finish them |
+| `glacon_skipped_deliveries_total` | counter | `output`, `reason` | Deliveries skipped: `ledger` (taken before a crash) or `already_written` (the output's hook) |
+| `glacon_in_flight_batches` | gauge | `input` | Batches read but not done (every minute) |
+| `glacon_state_pruned_total` | counter | `input` | Done batches forgotten by retention |
+
+## Logs
+
+Through `tracing`; every line has `route`, plus `input` or `output`. Errors
+are logged with their whole cause chain (`ErrorChain`, also exported for
+apps).
+
+| Event | Level | Fields |
+|---|---|---|
+| `starting route`, `ledger opened` | info | `state_dir`, `processed_retention`, `inputs`, `outputs`, `fresh_state`; then `fresh` |
+| `initializing output` / `output initialized` | info | `has_data`, `background_task`, `took_ms` |
+| `initializing input` / `input initialized` | info | `resume_point` (from the ledger), `in_flight`, `took_ms` |
+| `route started`, `route stopped` | info | |
+| `route failed to start`, `route failed` | error | `error` |
+| `processed batch` | info | `batch` (its key), `records`, `errors`, `error_reasons` (`duplicate=3 invalid=1`), `first_error`, `outputs`, `replayed`, `middleware_ms`, `handoff_ms` |
+| `record error` | debug | `batch`, `reason`, `message`: every middleware error |
+| `wrote batch` | debug | `batch`, `ok`, `err`, `took_ms` |
+| `replaying batch`, `already written` | info | `batch` |
+| `skipping done batch`, `pruned the ledger` | debug | |
+| `processor stopped, stopping input`, `output stopped, stopping processor` | warn | follows a failure, logged as `route failed` |
+| `input finished` | info | |
+
+The TaskManager names a route's tasks `input <name>`, `processor <name>`,
+`output <name>` and `input|output <name>: background`.
+
+
 
 ## Tests
 

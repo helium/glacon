@@ -11,7 +11,7 @@
 //! | [`RouteMiddleware`](crate::processor::RouteMiddleware) | the same |
 //! | [`PendingOutput`](crate::output::PendingOutput) | [`RouteOutput`](crate::output::RouteOutput) (the output with its state) |
 
-use crate::Result;
+use crate::{ErrorChain, Result};
 use futures::future;
 use task_manager::ManagedTask;
 
@@ -49,7 +49,9 @@ pub(crate) async fn init_all<L: Lifecycle>(all: Vec<L>) -> Result<Vec<Initialize
         match result {
             Ok(one) => started.push(one),
             Err(error) if failure.is_none() => failure = Some(error),
-            Err(error) => tracing::error!(%error, "another failed to initialize"),
+            Err(error) => {
+                tracing::error!(error = %ErrorChain(&error), "another failed to initialize")
+            }
         }
     }
     match failure {
@@ -66,6 +68,6 @@ pub(crate) async fn init_all<L: Lifecycle>(all: Vec<L>) -> Result<Vec<Initialize
 pub(crate) async fn terminate_all<T: Terminate>(mut all: Vec<T>) {
     let results = future::join_all(all.iter_mut().map(|one| one.terminate())).await;
     for error in results.into_iter().filter_map(Result::err) {
-        tracing::error!(%error, "failed to terminate");
+        tracing::error!(error = %ErrorChain(&error), "failed to terminate");
     }
 }

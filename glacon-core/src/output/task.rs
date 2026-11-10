@@ -4,6 +4,7 @@ use crate::{
     lifecycle::{Initialized, Lifecycle, Terminate},
     metrics,
 };
+use std::time::Instant;
 use tokio::sync::mpsc;
 
 /// Your output before `init`, with its context.
@@ -94,10 +95,22 @@ impl<R: GlaconRecord> Lifecycle for PendingOutput<R> {
 
     async fn init(self) -> Result<Initialized<RouteOutput<R>>> {
         let PendingOutput { ctx, init } = self;
+        // Logged before init too: an init stuck on its destination (a
+        // catalog that never answers) would otherwise log nothing at all.
+        tracing::info!(route = %ctx.route, output = %ctx.output, "initializing output");
+        let started = Instant::now();
         let ((output, task), has_data) = init
             .init(&ctx)
             .await
             .map_err(|e| Error::output(&ctx.route, &ctx.output, e))?;
+        tracing::info!(
+            route = %ctx.route,
+            output = %ctx.output,
+            has_data,
+            background_task = task.is_some(),
+            took_ms = started.elapsed().as_millis() as u64,
+            "output initialized"
+        );
         Ok((
             RouteOutput {
                 ctx,
@@ -165,14 +178,28 @@ async fn write<R: GlaconRecord>(
                 .await
                 .map_err(|e| Error::output(route, output, e))?;
         if written {
-            metrics::output_counter(metrics::SKIPPED_DELIVERIES, route, output, 1);
+            metrics::skipped_delivery(route, output, metrics::SKIPPED_ALREADY_WRITTEN);
             tracing::info!(route = %route, output = %output, batch = %ticket.id.key, "already written");
         } else {
+            let started = Instant::now();
             route_output
                 .output
                 .handle_data(&ticket.id, &records)
                 .await
                 .map_err(|e| Error::output(route, output, e))?;
+            let took = started.elapsed();
+            let err = records.iter().filter(|r| r.is_err()).count() as u64;
+            let ok = records.len() as u64 - err;
+            metrics::output_wrote(route, output, ok, err, took);
+            tracing::debug!(
+                route = %route,
+                output = %output,
+                batch = %ticket.id.key,
+                ok,
+                err,
+                took_ms = took.as_millis() as u64,
+                "wrote batch"
+            );
         }
         ticket.delivered(output).await?;
     }

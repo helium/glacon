@@ -7,7 +7,7 @@
 use crate::common::{self, End, Journal, MemoryInput, MemoryOutput, batch, event};
 use glacon_core::{
     BatchId, BoxError, Error, GlaconCoreMiddleware, GlaconCoreOutput, InitializedOutput,
-    OutputContext, RecordResult, Route, async_trait,
+    OutputContext, RecordError, RecordResult, Route, async_trait,
 };
 use std::sync::{Arc, Mutex, PoisonError};
 
@@ -226,8 +226,13 @@ impl GlaconCoreMiddleware<common::Event, Verified> for Verify {
         Ok(events
             .into_iter()
             .map(|e| match e.kind {
-                "reject" => Err(format!("{}: malformed", e.id)),
-                _ if e.id.starts_with("slow") => Err(format!("{}: too slow", e.id)),
+                "reject" => Err(RecordError::new(
+                    "malformed",
+                    format!("{}: malformed", e.id),
+                )),
+                _ if e.id.starts_with("slow") => {
+                    Err(RecordError::new("too_slow", format!("{}: too slow", e.id)))
+                }
                 _ => Ok(Verified { id: e.id }),
             })
             .collect())
@@ -278,7 +283,7 @@ impl GlaconCoreOutput<Verified> for VerifiedOutput {
         for record in records {
             match (self.invalid, record) {
                 (false, Ok(verified)) => rows.push(verified.id.clone()),
-                (true, Err(reason)) => rows.push(reason.clone()),
+                (true, Err(error)) => rows.push(error.message.clone()),
                 _ => {}
             }
         }

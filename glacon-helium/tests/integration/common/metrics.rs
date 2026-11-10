@@ -20,6 +20,7 @@ static SNAPSHOTTER: Mutex<Option<Snapshotter>> = Mutex::new(None);
 struct Totals {
     counters: HashMap<CompositeKey, u64>,
     gauges: HashSet<CompositeKey>,
+    histograms: HashSet<CompositeKey>,
 }
 
 static TOTALS: OnceLock<Mutex<Totals>> = OnceLock::new();
@@ -52,7 +53,9 @@ fn with_totals<T>(f: impl FnOnce(&Totals) -> T) -> anyhow::Result<T> {
             DebugValue::Gauge(_) => {
                 totals.gauges.insert(key);
             }
-            DebugValue::Histogram(_) => {}
+            DebugValue::Histogram(_) => {
+                totals.histograms.insert(key);
+            }
         }
     }
     Ok(f(&totals))
@@ -82,4 +85,14 @@ pub fn counter(name: &str, labels: &[(&str, &str)]) -> anyhow::Result<u64> {
 /// Whether gauge `name` was set for a series matching `labels`.
 pub fn gauge_exists(name: &str, labels: &[(&str, &str)]) -> anyhow::Result<bool> {
     with_totals(|totals| totals.gauges.iter().any(|key| matches(key, name, labels)))
+}
+
+/// Whether histogram `name` recorded a value for a series matching `labels`.
+pub fn histogram_exists(name: &str, labels: &[(&str, &str)]) -> anyhow::Result<bool> {
+    with_totals(|totals| {
+        totals
+            .histograms
+            .iter()
+            .any(|key| matches(key, name, labels))
+    })
 }

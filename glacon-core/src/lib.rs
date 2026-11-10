@@ -34,12 +34,12 @@ mod record;
 mod route;
 mod task;
 
-pub use error::{BoxError, Error, Result};
+pub use error::{BoxError, Error, ErrorChain, Result};
 pub use input::{Batch, BatchId, GlaconCoreInput, InitializedInput, InputContext};
 pub use ledger::{InputLedger, Ledger, STATE_DB};
 pub use output::{GlaconCoreOutput, InitializedOutput, OutputContext};
 pub use processor::middleware::{GlaconCoreMiddleware, MiddlewareContext, Passthrough};
-pub use record::{GlaconRecord, RecordResult};
+pub use record::{GlaconRecord, RecordError, RecordResult};
 pub use route::{FreshState, Route, RouteBuilder, RouteOutputs, RouteSettings};
 
 // Re-exported so inputs, outputs and middlewares can be implemented, and

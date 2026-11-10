@@ -135,7 +135,7 @@ returned are dropped, and the route fails without starting a task.
 | 23 | Fail the route unless there is one result per record; count the `Err` ones | sync | processor `us` | `process` |
 | 24 | On a replay: leave out the outputs the ledger says already took the batch | async (disk) | processor `us` | `process` |
 | 25 | Empty batch or no output left: mark the batch done. Otherwise send every output the whole batch at once, with one shared ticket counting them (blocks while that output has one queued) | async (disk or channels) | processor → outputs | `process`, `output/delivery.rs` |
-| 26 | Metrics + "processed batch" log | sync | processor `us` | `process` |
+| 26 | Metrics (lag, newest batch timestamp, middleware and hand-off times, errors by reason) + "processed batch" log | sync | processor `us` | `process` |
 
 ### 6. Output (per batch)
 

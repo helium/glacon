@@ -26,7 +26,8 @@ valid tests in one, the middleware's errors in the other.
 
 ```rust
 use glacon_helium::{
-    FileMeta, FileStoreInput, GlaconInput, GlaconOutput, IcebergOutput, Route, RouteSettings,
+    FileMeta, FileStoreInput, GlaconInput, GlaconOutput, IcebergOutput, RecordError, Route,
+    RouteSettings,
     helium_iceberg::{self, TableDefinition},
     task_manager::TaskManager,
 };
@@ -72,8 +73,8 @@ impl GlaconOutput<VerifiedSpeedTest> for RejectedTable {
 
     fn to_rows(&self, _: &VerifiedSpeedTest, _: &mut Vec<RejectedRow>) {}
 
-    fn to_error_rows(&self, error: &str, rows: &mut Vec<RejectedRow>) {
-        rows.push(RejectedRow::new(error));
+    fn to_error_rows(&self, error: &RecordError, rows: &mut Vec<RejectedRow>) {
+        rows.push(RejectedRow::new(error.reason, &error.message));
     }
 }
 
@@ -151,12 +152,37 @@ caveats, from `helium_iceberg`:
 
 ## Metrics
 
-On top of glacon-core's:
+On top of glacon-core's (milliseconds for times and durations):
 
-- `glacon_records_decoded_total` (`FileStoreInput`)
-- `glacon_decode_failures_total` (`FileStoreInput`)
-- `glacon_output_rows_total` (`IcebergOutput`): rows kept, where
-  `glacon_output_records_total` counts the records handed to the output
+| Metric | Type | Labels | What |
+|---|---|---|---|
+| `glacon_records_decoded_total` | counter | `input` | Messages `GlaconInput::decode` made a record of (`FileStoreInput`) |
+| `glacon_decode_failures_total` | counter | `input` | Messages `GlaconInput::decode` returned `None` for |
+| `glacon_output_rows_total` | counter | `output`, `kind` | Rows queued to the table (`IcebergOutput`): `ok` from `to_rows`, `err` from `to_error_rows` |
+
+The oracles crates underneath add their own, with other label names:
+
+| Metric | From | Labels | What |
+|---|---|---|---|
+| `file-processing-latency` (seconds), `file-processing-timestamp` | file_store poller | `process-name` (the input's name), `file-type` (its prefix) | Age and timestamp of the file just read |
+| `file-decode-failures` | file_store poller | `process-name`, `file-type` | Protobuf messages that could not be read or decoded, left out before `GlaconInput::decode` sees them; logged with the file key |
+| `iceberg-writer-commits`, `iceberg-writer-commit-failures` | helium_iceberg `BatchedWriter` | `table`, `reason` | Commits, and failed ones (`size`, `timeout`, `shutdown`, …) |
+| `iceberg-writer-committed-records`, `iceberg-writer-commit-duration-ms` | `BatchedWriter` | `table` | Rows committed, and how long each commit took |
+| `iceberg-writer-spool-records`, `iceberg-writer-oldest-spooled-timestamp-ms` | `BatchedWriter` | `table` | Rows waiting in the spool, and since when (0 when empty) |
+
+`glacon_output_rows_total` counts rows in the spool, not in the table: a
+batch is delivered once spooled. Rows reach the table, and Trino, only when
+the writer commits:
+
+```promql
+# Rows waiting more than twice the batch timeout to be committed (the
+# Prometheus exporter turns the dashes of oracles' names into underscores)
+iceberg_writer_oldest_spooled_timestamp_ms > 0
+  and time() * 1000 - iceberg_writer_oldest_spooled_timestamp_ms > 2 * 15 * 60 * 1000
+```
+
+(`file-decode-failures` and the `iceberg-writer-*` series need an oracles
+version that has them.)
 
 ## Tests
 

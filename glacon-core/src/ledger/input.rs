@@ -57,7 +57,7 @@ impl InputLedger {
     pub async fn prune(&self, window_start: DateTime<Utc>) -> Result<u64> {
         let before = window_start.min(Utc::now() - self.retention);
         let pruned = self.ledger.prune(&self.input, before).await?;
-        metrics::state_pruned(&self.route, pruned);
+        metrics::state_pruned(&self.route, &self.input, pruned);
         Ok(pruned)
     }
 

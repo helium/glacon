@@ -4,7 +4,7 @@
 
 use crate::common::{self, End, Journal, MemoryInput, MemoryOutput, batch, event};
 use glacon_core::{
-    BatchId, BoxError, Error, GlaconCoreMiddleware, RecordResult, Route, async_trait,
+    BatchId, BoxError, Error, GlaconCoreMiddleware, RecordError, RecordResult, Route, async_trait,
 };
 use std::{
     collections::{HashMap, HashSet},
@@ -120,7 +120,10 @@ impl GlaconCoreMiddleware<common::Event, common::Event> for Dedup {
                 if *claimer == this && in_batch.insert(e.id.clone()) {
                     Ok(e)
                 } else {
-                    Err(format!("{}: duplicate", e.id))
+                    Err(RecordError::new(
+                        "duplicate",
+                        format!("{}: duplicate", e.id),
+                    ))
                 }
             })
             .collect())

@@ -5,6 +5,7 @@ use crate::{
     lifecycle::{Initialized, Lifecycle, Terminate},
     metrics,
 };
+use std::time::Instant;
 use tokio::sync::{mpsc, oneshot};
 
 /// Your input before `init`, with its context.
@@ -68,10 +69,29 @@ impl<R: GlaconRecord> Lifecycle for PendingInput<R> {
 
     async fn init(self) -> Result<Initialized<RouteInput<R>>> {
         let PendingInput { ctx, init } = self;
+        // Where the ledger says this input resumes: explains which batches
+        // it reads again, or skips, after a restart.
+        let resume_point = ctx.ledger.resume_point().await?;
+        let in_flight = ctx.ledger.in_flight().await?;
+        tracing::info!(
+            route = %ctx.route,
+            input = %ctx.input,
+            resume_point = %resume_point.map_or("none (first run)".to_string(), |t| t.to_rfc3339()),
+            in_flight,
+            "initializing input"
+        );
+        let started = Instant::now();
         let (input, task) = init
             .init(&ctx)
             .await
             .map_err(|e| Error::input(&ctx.route, &ctx.input, e))?;
+        tracing::info!(
+            route = %ctx.route,
+            input = %ctx.input,
+            background_task = task.is_some(),
+            took_ms = started.elapsed().as_millis() as u64,
+            "input initialized"
+        );
         Ok((RouteInput { ctx, input }, task))
     }
 }
