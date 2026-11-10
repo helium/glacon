@@ -30,7 +30,7 @@ helium-iceberg = { workspace = true, features = ["test-harness"] }
 metrics-util.workspace = true
 serde_json.workspace = true
 tempfile.workspace = true
-trino-rust-client = "0.11"
+trino-rust-client = "0.12"
 triggered.workspace = true
 
 [[test]]
