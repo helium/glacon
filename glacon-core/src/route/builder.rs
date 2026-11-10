@@ -1,13 +1,13 @@
 use super::{FreshState, Route, RouteParts, RouteSettings};
 use crate::{
-    Error, GlaconCoreInput, GlaconCoreMiddleware, GlaconCoreOutput, GlaconRecord, Passthrough,
-    Result, input::InitInput, output::InitOutput,
+    Error, GlaconCoreInput, GlaconCoreMiddleware, GlaconCoreOutput, GlaconRecord,
+    GlaconRecordError, Passthrough, Result, input::InitInput, output::InitOutput,
 };
-use std::{collections::HashSet, sync::Mutex};
+use std::{collections::HashSet, convert::Infallible, sync::Mutex};
 
 /// Creates the middleware of each input's processor.
-pub(crate) type MiddlewareFactory<In, Out> =
-    Box<dyn Fn() -> Box<dyn GlaconCoreMiddleware<In, Out>> + Send>;
+pub(crate) type MiddlewareFactory<In, Out, E> =
+    Box<dyn Fn() -> Box<dyn GlaconCoreMiddleware<In, Out, Error = E>> + Send>;
 
 impl<In: GlaconRecord> Route<In> {
     /// Start building a route. `settings.state_dir` holds its ledger: give
@@ -25,19 +25,20 @@ impl<In: GlaconRecord> Route<In> {
 /// Builds a [`Route`], in the order data flows: inputs, then optionally the
 /// middleware, then outputs. Adding the middleware or the first output turns
 /// it into a [`RouteOutputs`], which takes outputs and builds the route.
+/// The middleware sets both the record type and the error type outputs get.
 ///
 /// ```ignore
 /// let route = Route::builder("speedtests", RouteSettings::new("/data/speedtests"))
 ///     .input("us", us_input)                   // produce SpeedTest
 ///     .input("eu", eu_input)
-///     .middleware(VerifySpeedTest::default())  // SpeedTest -> VerifiedSpeedTest
-///     .output("verified", verified_output)     // get VerifiedSpeedTest
+///     .middleware(VerifySpeedTest::default())  // SpeedTest -> VerifiedSpeedTest or VerifyError
+///     .output("verified", verified_output)     // get Result<VerifiedSpeedTest, VerifyError>
 ///     .output("dropped", dropped_output)
 ///     .build()?;
 /// ```
 ///
-/// Without a middleware, outputs get the inputs' records unchanged
-/// ([`Passthrough`]).
+/// Without a middleware, outputs get the inputs' records unchanged, and no
+/// error ([`Passthrough`]).
 pub struct RouteBuilder<In> {
     name: String,
     inputs: Vec<(String, Box<dyn InitInput<In>>)>,
@@ -61,10 +62,10 @@ impl<In: GlaconRecord> RouteBuilder<In> {
     }
 
     /// Set the route's middleware, turning the inputs' `In` records into the
-    /// `Out` records outputs get. It is cloned for each input's processor:
+    /// `Out` records, or its `M::Error` errors, outputs get. It is cloned for each input's processor:
     /// share state between the clones through an `Arc`, and create what
     /// can't be cloned (a connection) in its `init`.
-    pub fn middleware<Out, M>(self, middleware: M) -> RouteOutputs<In, Out>
+    pub fn middleware<Out, M>(self, middleware: M) -> RouteOutputs<In, Out, M::Error>
     where
         Out: GlaconRecord,
         M: GlaconCoreMiddleware<In, Out> + Clone,
@@ -81,25 +82,29 @@ impl<In: GlaconRecord> RouteBuilder<In> {
     pub fn output(
         self,
         name: impl Into<String>,
-        output: impl GlaconCoreOutput<In>,
-    ) -> RouteOutputs<In, In> {
+        output: impl GlaconCoreOutput<In, Infallible>,
+    ) -> RouteOutputs<In, In, Infallible> {
         self.middleware(Passthrough).output(name, output)
     }
 }
 
 /// A [`RouteBuilder`] once its middleware is set: takes the outputs, then
 /// [`RouteOutputs::build`] validates the route.
-pub struct RouteOutputs<In, Out> {
+pub struct RouteOutputs<In, Out, E = Infallible> {
     route: RouteBuilder<In>,
-    middleware: MiddlewareFactory<In, Out>,
-    outputs: Vec<(String, Box<dyn InitOutput<Out>>)>,
+    middleware: MiddlewareFactory<In, Out, E>,
+    outputs: Vec<(String, Box<dyn InitOutput<Out, E>>)>,
 }
 
-impl<In: GlaconRecord, Out: GlaconRecord> RouteOutputs<In, Out> {
+impl<In: GlaconRecord, Out: GlaconRecord, E: GlaconRecordError> RouteOutputs<In, Out, E> {
     /// Add an output. It gets every record of every batch, and keeps what it
     /// wants. `name` identifies it in logs and metrics, and in the ledger, so
     /// keep it stable.
-    pub fn output(mut self, name: impl Into<String>, output: impl GlaconCoreOutput<Out>) -> Self {
+    pub fn output(
+        mut self,
+        name: impl Into<String>,
+        output: impl GlaconCoreOutput<Out, E>,
+    ) -> Self {
         self.outputs.push((name.into(), Box::new(output)));
         self
     }
@@ -111,7 +116,7 @@ impl<In: GlaconRecord, Out: GlaconRecord> RouteOutputs<In, Out> {
     }
 
     /// Validate and build the route.
-    pub fn build(self) -> Result<Route<In, Out>> {
+    pub fn build(self) -> Result<Route<In, Out, E>> {
         let RouteOutputs {
             route:
                 RouteBuilder {
@@ -197,7 +202,7 @@ mod tests {
     /// Writes any record type.
     struct Out;
     #[async_trait::async_trait]
-    impl<R: GlaconRecord> GlaconCoreOutput<R> for Out {
+    impl<R: GlaconRecord, E: GlaconRecordError> GlaconCoreOutput<R, E> for Out {
         type State = ();
 
         async fn init(&mut self, _: &OutputContext) -> Result<InitializedOutput<()>, BoxError> {
@@ -208,7 +213,7 @@ mod tests {
             &mut self,
             _: &mut (),
             _: &BatchId,
-            _: &[RecordResult<R>],
+            _: &[RecordResult<R, E>],
         ) -> Result<(), BoxError> {
             Ok(())
         }
@@ -219,11 +224,13 @@ mod tests {
     struct Count;
     #[async_trait::async_trait]
     impl GlaconCoreMiddleware<(), u32> for Count {
+        type Error = Infallible;
+
         async fn handle_data(
             &mut self,
             _: &BatchId,
             records: Vec<()>,
-        ) -> Result<Vec<RecordResult<u32>>, BoxError> {
+        ) -> Result<Vec<RecordResult<u32, Infallible>>, BoxError> {
             Ok((0..records.len() as u32).map(Ok).collect())
         }
     }

@@ -30,6 +30,21 @@ pub enum Error {
         source: BoxError,
     },
 
+    /// The middleware did not return exactly one result per record of a
+    /// batch.
+    #[error(
+        "route {route}: middleware of input {input}: returned {results} results \
+         for the {records} records of batch {batch}"
+    )]
+    MiddlewareResultCount {
+        route: String,
+        input: String,
+        /// The batch's key.
+        batch: String,
+        records: usize,
+        results: usize,
+    },
+
     /// An output failed to initialize, write or terminate.
     #[error("route {route}: output {output}: {source}")]
     Output {

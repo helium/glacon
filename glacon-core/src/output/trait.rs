@@ -1,5 +1,6 @@
 use super::OutputContext;
-use crate::{BatchId, BoxError, GlaconRecord, RecordResult};
+use crate::{BatchId, BoxError, GlaconRecord, GlaconRecordError, RecordResult};
+use std::convert::Infallible;
 use task_manager::ManagedTask;
 
 /// An output: writes records somewhere (a table, a topic, ...).
@@ -13,10 +14,14 @@ use task_manager::ManagedTask;
 /// processor stopped. An error stops the route.
 ///
 /// An output gets every record of every batch, as the middleware left them:
-/// `Ok` with a record, or `Err` with why the middleware could not make one
-/// (see [`RecordResult`]). It keeps what it wants: deciding which records to
-/// write, and what to do with the failures (write them somewhere, count
-/// them, ignore them), is its job. That decision must depend on the result
+/// `Ok` with a record, or `Err` with why the middleware could not make one,
+/// of the middleware's error type `E` (see [`RecordResult`]); `E` is
+/// [`Infallible`] on a route without a middleware. An output that ignores
+/// errors can implement this for any `E: GlaconRecordError`.
+///
+/// It keeps what it wants: deciding which records to write, and what to do
+/// with the failures (write them somewhere, count them, ignore them, match
+/// on `E`'s variants), is its job. That decision must depend on the result
 /// alone, so a replayed batch gives the same outcome.
 ///
 /// An output with nothing to set up has `()` as its state:
@@ -29,7 +34,9 @@ use task_manager::ManagedTask;
 /// }
 /// ```
 #[async_trait::async_trait]
-pub trait GlaconCoreOutput<R: GlaconRecord>: Send + 'static {
+pub trait GlaconCoreOutput<R: GlaconRecord, E: GlaconRecordError = Infallible>:
+    Send + 'static
+{
     /// What `init` builds and the other calls write with.
     type State: Send + 'static;
 
@@ -58,7 +65,7 @@ pub trait GlaconCoreOutput<R: GlaconRecord>: Send + 'static {
         &mut self,
         state: &mut Self::State,
         batch: &BatchId,
-        records: &[RecordResult<R>],
+        records: &[RecordResult<R, E>],
     ) -> Result<(), BoxError>;
 
     /// Whether this output already holds `batch`: asked only when a batch is

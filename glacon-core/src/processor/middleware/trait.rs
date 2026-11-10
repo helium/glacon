@@ -1,5 +1,5 @@
 use super::MiddlewareContext;
-use crate::{BatchId, BoxError, GlaconRecord, RecordResult};
+use crate::{BatchId, BoxError, GlaconRecord, GlaconRecordError, RecordResult};
 
 /// Transforms the records of every batch before the outputs get them: from
 /// what inputs produce (`In`) to what outputs write (`Out`).
@@ -13,8 +13,8 @@ use crate::{BatchId, BoxError, GlaconRecord, RecordResult};
 /// A middleware does not pick outputs, nor drop records: it returns one
 /// [`RecordResult`] per input record, in order, and every output gets all of
 /// them. A record that should reach no output as data (malformed, a
-/// duplicate) becomes an `Err` saying why; each output decides what to do
-/// with it. A decision several outputs depend on (is this record valid?) is
+/// duplicate) becomes an `Err` of the middleware's [`Error`](Self::Error)
+/// type saying why; each output decides what to do with it. A decision several outputs depend on (is this record valid?) is
 /// made here once, for each output to act on.
 ///
 /// After a crash, a batch that was not done is handled again, and must give
@@ -25,6 +25,11 @@ use crate::{BatchId, BoxError, GlaconRecord, RecordResult};
 /// replay.
 #[async_trait::async_trait]
 pub trait GlaconCoreMiddleware<In: GlaconRecord, Out: GlaconRecord>: Send + 'static {
+    /// Why a record failed: the `Err` of each [`RecordResult`], handed to the
+    /// outputs as is. A middleware that never fails a record uses
+    /// [`Infallible`](std::convert::Infallible).
+    type Error: GlaconRecordError;
+
     async fn init(&mut self, _ctx: &MiddlewareContext) -> Result<(), BoxError> {
         Ok(())
     }
@@ -38,7 +43,7 @@ pub trait GlaconCoreMiddleware<In: GlaconRecord, Out: GlaconRecord>: Send + 'sta
         &mut self,
         batch: &BatchId,
         records: Vec<In>,
-    ) -> Result<Vec<RecordResult<Out>>, BoxError>;
+    ) -> Result<Vec<RecordResult<Out, Self::Error>>, BoxError>;
 
     async fn terminate(&mut self) -> Result<(), BoxError> {
         Ok(())

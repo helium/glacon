@@ -1,6 +1,6 @@
 use super::{Delivery, GlaconCoreOutput, InitializedOutput, OutputContext};
 use crate::{
-    BatchId, BoxError, Error, GlaconRecord, RecordResult, Result,
+    BatchId, BoxError, Error, GlaconRecord, GlaconRecordError, RecordResult, Result,
     lifecycle::{Initialized, Lifecycle, Terminate},
     metrics,
 };
@@ -8,15 +8,15 @@ use std::time::Instant;
 use tokio::sync::mpsc;
 
 /// Your output before `init`, with its context.
-pub(crate) struct PendingOutput<R> {
+pub(crate) struct PendingOutput<R, E> {
     pub ctx: OutputContext,
-    pub init: Box<dyn InitOutput<R>>,
+    pub init: Box<dyn InitOutput<R, E>>,
 }
 
 /// Your output after `init`, with its state: what its task writes to.
-pub(crate) struct RouteOutput<R> {
+pub(crate) struct RouteOutput<R, E> {
     pub ctx: OutputContext,
-    pub output: Box<dyn WriteOutput<R>>,
+    pub output: Box<dyn WriteOutput<R, E>>,
     /// The destination already held data when initialized.
     pub has_data: bool,
 }
@@ -24,37 +24,37 @@ pub(crate) struct RouteOutput<R> {
 /// Any [`GlaconCoreOutput`] before `init`, whatever its state. Returns it
 /// started, and whether the destination already held data.
 #[async_trait::async_trait]
-pub(crate) trait InitOutput<R>: Send {
+pub(crate) trait InitOutput<R, E>: Send {
     async fn init(
         self: Box<Self>,
         ctx: &OutputContext,
-    ) -> Result<(Initialized<Box<dyn WriteOutput<R>>>, bool), BoxError>;
+    ) -> Result<(Initialized<Box<dyn WriteOutput<R, E>>>, bool), BoxError>;
 }
 
 /// Any [`GlaconCoreOutput`] after `init`, holding its state.
 #[async_trait::async_trait]
-pub(crate) trait WriteOutput<R>: Send {
+pub(crate) trait WriteOutput<R, E>: Send {
     async fn handle_data(
         &mut self,
         batch: &BatchId,
-        records: &[RecordResult<R>],
+        records: &[RecordResult<R, E>],
     ) -> Result<(), BoxError>;
     async fn already_written(&mut self, batch: &BatchId) -> Result<bool, BoxError>;
     async fn terminate(&mut self) -> Result<(), BoxError>;
 }
 
 /// An output with the state its `init` built.
-struct Started<O: GlaconCoreOutput<R>, R: GlaconRecord> {
+struct Started<O: GlaconCoreOutput<R, E>, R: GlaconRecord, E: GlaconRecordError> {
     output: O,
     state: O::State,
 }
 
 #[async_trait::async_trait]
-impl<R: GlaconRecord, O: GlaconCoreOutput<R>> InitOutput<R> for O {
+impl<R: GlaconRecord, E: GlaconRecordError, O: GlaconCoreOutput<R, E>> InitOutput<R, E> for O {
     async fn init(
         mut self: Box<Self>,
         ctx: &OutputContext,
-    ) -> Result<(Initialized<Box<dyn WriteOutput<R>>>, bool), BoxError> {
+    ) -> Result<(Initialized<Box<dyn WriteOutput<R, E>>>, bool), BoxError> {
         let InitializedOutput {
             state,
             task,
@@ -69,11 +69,13 @@ impl<R: GlaconRecord, O: GlaconCoreOutput<R>> InitOutput<R> for O {
 }
 
 #[async_trait::async_trait]
-impl<R: GlaconRecord, O: GlaconCoreOutput<R>> WriteOutput<R> for Started<O, R> {
+impl<R: GlaconRecord, E: GlaconRecordError, O: GlaconCoreOutput<R, E>> WriteOutput<R, E>
+    for Started<O, R, E>
+{
     async fn handle_data(
         &mut self,
         batch: &BatchId,
-        records: &[RecordResult<R>],
+        records: &[RecordResult<R, E>],
     ) -> Result<(), BoxError> {
         self.output
             .handle_data(&mut self.state, batch, records)
@@ -90,10 +92,10 @@ impl<R: GlaconRecord, O: GlaconCoreOutput<R>> WriteOutput<R> for Started<O, R> {
 }
 
 #[async_trait::async_trait]
-impl<R: GlaconRecord> Lifecycle for PendingOutput<R> {
-    type Started = RouteOutput<R>;
+impl<R: GlaconRecord, E: GlaconRecordError> Lifecycle for PendingOutput<R, E> {
+    type Started = RouteOutput<R, E>;
 
-    async fn init(self) -> Result<Initialized<RouteOutput<R>>> {
+    async fn init(self) -> Result<Initialized<RouteOutput<R, E>>> {
         let PendingOutput { ctx, init } = self;
         // Logged before init too: an init stuck on its destination (a
         // catalog that never answers) would otherwise log nothing at all.
@@ -123,7 +125,7 @@ impl<R: GlaconRecord> Lifecycle for PendingOutput<R> {
 }
 
 #[async_trait::async_trait]
-impl<R: GlaconRecord> Terminate for RouteOutput<R> {
+impl<R: GlaconRecord, E: GlaconRecordError> Terminate for RouteOutput<R, E> {
     async fn terminate(&mut self) -> Result {
         self.output
             .terminate()
@@ -137,9 +139,9 @@ impl<R: GlaconRecord> Terminate for RouteOutput<R> {
 ///
 /// Each written batch is recorded in the ledger as delivered to this output.
 /// A replayed batch the output says it already has is only recorded.
-pub(crate) async fn run<R: GlaconRecord>(
-    mut route_output: RouteOutput<R>,
-    mut deliveries: mpsc::Receiver<Delivery<R>>,
+pub(crate) async fn run<R: GlaconRecord, E: GlaconRecordError>(
+    mut route_output: RouteOutput<R, E>,
+    mut deliveries: mpsc::Receiver<Delivery<R, E>>,
     shutdown: triggered::Listener,
 ) -> Result {
     let written = write(&mut route_output, &mut deliveries, &shutdown).await;
@@ -149,9 +151,9 @@ pub(crate) async fn run<R: GlaconRecord>(
     written.and(terminated)
 }
 
-async fn write<R: GlaconRecord>(
-    route_output: &mut RouteOutput<R>,
-    deliveries: &mut mpsc::Receiver<Delivery<R>>,
+async fn write<R: GlaconRecord, E: GlaconRecordError>(
+    route_output: &mut RouteOutput<R, E>,
+    deliveries: &mut mpsc::Receiver<Delivery<R, E>>,
     shutdown: &triggered::Listener,
 ) -> Result {
     let OutputContext { route, output } = &route_output.ctx;

@@ -27,8 +27,8 @@ pub use fresh_state::FreshState;
 pub use settings::RouteSettings;
 
 use crate::{
-    BoxError, Error, ErrorChain, GlaconRecord, InputContext, MiddlewareContext, OutputContext,
-    Result,
+    BoxError, Error, ErrorChain, GlaconRecord, GlaconRecordError, InputContext, MiddlewareContext,
+    OutputContext, Result,
     input::{self, InitInput, PendingInput, RouteInput},
     ledger::{InputLedger, Ledger},
     lifecycle::{Initialized, init_all, terminate_all},
@@ -37,7 +37,10 @@ use crate::{
     task::{BackgroundTask, Owner, RouteTask, unwrap_task_error},
 };
 use builder::MiddlewareFactory;
-use std::sync::{Arc, Mutex, PoisonError};
+use std::{
+    convert::Infallible,
+    sync::{Arc, Mutex, PoisonError},
+};
 use task_manager::{ManagedTask, TaskFuture, TaskManager};
 use tokio::sync::{mpsc, oneshot};
 
@@ -46,30 +49,31 @@ use tokio::sync::{mpsc, oneshot};
 const CHANNEL_CAPACITY: usize = 1;
 
 /// A validated route, ready to run as a task. Its inputs produce `In`
-/// records, which its middleware turns into the `Out` records its outputs
-/// get (the same type without a middleware).
-pub struct Route<In, Out = In> {
+/// records, which its middleware turns into the `Out` records, or `E`
+/// errors, its outputs get (without a middleware, the same records and no
+/// error: [`Infallible`]).
+pub struct Route<In, Out = In, E = Infallible> {
     name: Arc<str>,
     /// Taken once, when the route starts. Behind a mutex because
     /// `ManagedTask` requires `Sync` and stages only need `Send`.
-    parts: Mutex<RouteParts<In, Out>>,
+    parts: Mutex<RouteParts<In, Out, E>>,
 }
 
-struct RouteParts<In, Out> {
+struct RouteParts<In, Out, E> {
     inputs: Vec<(String, Box<dyn InitInput<In>>)>,
-    middleware: MiddlewareFactory<In, Out>,
-    outputs: Vec<(String, Box<dyn InitOutput<Out>>)>,
+    middleware: MiddlewareFactory<In, Out, E>,
+    outputs: Vec<(String, Box<dyn InitOutput<Out, E>>)>,
     settings: RouteSettings,
     fresh_state: FreshState,
 }
 
-impl<In: GlaconRecord, Out: GlaconRecord> Route<In, Out> {
+impl<In: GlaconRecord, Out: GlaconRecord, E: GlaconRecordError> Route<In, Out, E> {
     pub fn name(&self) -> &str {
         &self.name
     }
 }
 
-impl<In: GlaconRecord, Out: GlaconRecord> ManagedTask for Route<In, Out> {
+impl<In: GlaconRecord, Out: GlaconRecord, E: GlaconRecordError> ManagedTask for Route<In, Out, E> {
     fn start_task(self: Box<Self>, shutdown: triggered::Listener) -> TaskFuture {
         let Route { name, parts } = *self;
         let parts = parts.into_inner().unwrap_or_else(PoisonError::into_inner);
@@ -77,9 +81,9 @@ impl<In: GlaconRecord, Out: GlaconRecord> ManagedTask for Route<In, Out> {
     }
 }
 
-async fn run<In: GlaconRecord, Out: GlaconRecord>(
+async fn run<In: GlaconRecord, Out: GlaconRecord, E: GlaconRecordError>(
     route: Arc<str>,
-    parts: RouteParts<In, Out>,
+    parts: RouteParts<In, Out, E>,
     shutdown: triggered::Listener,
 ) -> Result<(), BoxError> {
     let tasks = match up(&route, parts).await {
@@ -107,9 +111,9 @@ async fn run<In: GlaconRecord, Out: GlaconRecord>(
 /// Open the ledger, initialize every stage, layer by layer, then wire them
 /// into the route's TaskManager. A failed init terminates the layers already
 /// initialized.
-async fn up<In: GlaconRecord, Out: GlaconRecord>(
+async fn up<In: GlaconRecord, Out: GlaconRecord, E: GlaconRecordError>(
     route: &Arc<str>,
-    parts: RouteParts<In, Out>,
+    parts: RouteParts<In, Out, E>,
 ) -> Result<TaskManager> {
     let RouteParts {
         inputs,
@@ -250,11 +254,11 @@ fn stages<S>(started: Vec<Initialized<S>>) -> Vec<S> {
 /// ```
 ///
 /// so a background task starts before its stage and stops after it.
-fn wire<In: GlaconRecord, Out: GlaconRecord>(
+fn wire<In: GlaconRecord, Out: GlaconRecord, E: GlaconRecordError>(
     route: &Arc<str>,
     inputs: Vec<Initialized<RouteInput<In>>>,
-    middlewares: Vec<RouteMiddleware<In, Out>>,
-    outputs: Vec<Initialized<RouteOutput<Out>>>,
+    middlewares: Vec<RouteMiddleware<In, Out, E>>,
+    outputs: Vec<Initialized<RouteOutput<Out, E>>>,
 ) -> TaskManager {
     let mut tasks = TaskManager::builder();
 

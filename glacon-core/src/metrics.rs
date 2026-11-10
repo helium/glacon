@@ -25,7 +25,7 @@ pub const MIDDLEWARE_DURATION: &str = "glacon_middleware_ms";
 /// an output is slower than the input.
 pub const OUTPUT_HANDOFF: &str = "glacon_output_handoff_ms";
 /// Records the middleware turned into an `Err`, by `reason`
-/// ([`RecordError::reason`](crate::RecordError)).
+/// ([`GlaconRecordError::reason`](crate::GlaconRecordError::reason)).
 pub const MIDDLEWARE_ERRORS: &str = "glacon_middleware_errors_total";
 /// Results an output wrote, by `kind`: `ok` for records, `err` for the
 /// middleware's errors (it may keep fewer of either).

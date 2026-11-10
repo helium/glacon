@@ -11,7 +11,7 @@ pub use harness::Harness;
 use chrono::{DateTime, Duration, Utc};
 use glacon_helium::{
     BatchId, BoxError, FileMeta, FileStoreInput, GlaconCoreMiddleware, GlaconInput, GlaconOutput,
-    IcebergOutput, RecordError, RecordResult, Route, RouteBuilder, RouteOutputs, async_trait,
+    GlaconRecordError, IcebergOutput, RecordResult, Route, RouteBuilder, RouteOutputs, async_trait,
     helium_iceberg::{FieldDefinition, PartitionDefinition, TableDefinition},
     task_manager::ManagedTask,
 };
@@ -147,7 +147,7 @@ pub struct EventRow {
     occurred_at: DateTime<Utc>,
 }
 
-impl GlaconOutput<Event> for EventsTable {
+impl<E: GlaconRecordError> GlaconOutput<Event, E> for EventsTable {
     type Row = EventRow;
 
     fn table(&self) -> glacon_helium::helium_iceberg::Result<TableDefinition> {
@@ -185,7 +185,7 @@ pub struct ValueRow {
     occurred_at: DateTime<Utc>,
 }
 
-impl GlaconOutput<Event> for ValuesTable {
+impl<E: GlaconRecordError> GlaconOutput<Event, E> for ValuesTable {
     type Row = ValueRow;
 
     fn table(&self) -> glacon_helium::helium_iceberg::Result<TableDefinition> {
@@ -214,7 +214,7 @@ impl GlaconOutput<Event> for ValuesTable {
 /// &[Kind::A, Kind::Both])`.
 pub struct Only<T>(pub T, pub &'static [Kind]);
 
-impl<T: GlaconOutput<Event>> GlaconOutput<Event> for Only<T> {
+impl<E: GlaconRecordError, T: GlaconOutput<Event, E>> GlaconOutput<Event, E> for Only<T> {
     type Row = T::Row;
 
     fn table(&self) -> glacon_helium::helium_iceberg::Result<TableDefinition> {
@@ -237,7 +237,7 @@ pub struct RejectRow {
     rejected_at: DateTime<Utc>,
 }
 
-impl GlaconOutput<Event> for RejectsTable {
+impl GlaconOutput<Event, Rejected> for RejectsTable {
     type Row = RejectRow;
 
     fn table(&self) -> glacon_helium::helium_iceberg::Result<TableDefinition> {
@@ -252,15 +252,35 @@ impl GlaconOutput<Event> for RejectsTable {
 
     fn to_rows(&self, _: &Event, _: &mut Vec<RejectRow>) {}
 
-    fn to_error_rows(&self, error: &RecordError, rows: &mut Vec<RejectRow>) {
+    fn to_error_rows(&self, error: &Rejected, rows: &mut Vec<RejectRow>) {
         rows.push(RejectRow {
-            error: error.message.clone(),
+            error: error.to_string(),
             rejected_at: Utc::now(),
         });
     }
 }
 
 // ---------------------------------------------------------------- middleware
+
+/// Why [`RejectDrop`] rejected an event.
+#[derive(Debug)]
+pub struct Rejected {
+    pub id: String,
+}
+
+impl std::fmt::Display for Rejected {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}: rejected", self.id)
+    }
+}
+
+impl std::error::Error for Rejected {}
+
+impl GlaconRecordError for Rejected {
+    fn reason(&self) -> &'static str {
+        "rejected"
+    }
+}
 
 /// Rejects "drop" events (outputs get an error for each); the rest pass
 /// unchanged.
@@ -269,15 +289,17 @@ pub struct RejectDrop;
 
 #[async_trait]
 impl GlaconCoreMiddleware<Event, Event> for RejectDrop {
+    type Error = Rejected;
+
     async fn handle_data(
         &mut self,
         _: &BatchId,
         events: Vec<Event>,
-    ) -> Result<Vec<RecordResult<Event>>, BoxError> {
+    ) -> Result<Vec<RecordResult<Event, Rejected>>, BoxError> {
         Ok(events
             .into_iter()
             .map(|e| match e.kind {
-                Kind::Drop => Err(RecordError::new("rejected", format!("{}: rejected", e.id))),
+                Kind::Drop => Err(Rejected { id: e.id }),
                 _ => Ok(e),
             })
             .collect())

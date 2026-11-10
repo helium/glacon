@@ -6,10 +6,13 @@
 
 use crate::common::{self, End, Journal, MemoryInput, MemoryOutput, batch, event};
 use glacon_core::{
-    BatchId, BoxError, Error, GlaconCoreMiddleware, GlaconCoreOutput, InitializedOutput,
-    OutputContext, RecordError, RecordResult, Route, async_trait,
+    BatchId, BoxError, Error, GlaconCoreMiddleware, GlaconCoreOutput, GlaconRecordError,
+    InitializedOutput, OutputContext, RecordResult, Route, async_trait,
 };
-use std::sync::{Arc, Mutex, PoisonError};
+use std::{
+    convert::Infallible,
+    sync::{Arc, Mutex, PoisonError},
+};
 
 // ---------------------------------------------------------------- transforming
 
@@ -158,12 +161,11 @@ async fn a_middleware_dropping_records_fails_the_route() -> anyhow::Result<()> {
 
     let err = common::route_error(&err);
     assert!(
-        matches!(err, Error::Middleware { input, .. } if input == "us"),
-        "{err}"
-    );
-    assert!(
-        err.to_string()
-            .contains("returned 1 results for the 2 records"),
+        matches!(
+            err,
+            Error::MiddlewareResultCount { input, batch, records: 2, results: 1, .. }
+                if input == "us" && batch == "us.1"
+        ),
         "{err}"
     );
     assert!(output.batches().is_empty());
@@ -211,6 +213,24 @@ struct Verified {
     id: String,
 }
 
+/// Why [`Verify`] rejected an event.
+#[derive(Debug, thiserror::Error)]
+enum VerifyError {
+    #[error("{id}: malformed")]
+    Malformed { id: String },
+    #[error("{id}: too slow")]
+    TooSlow { id: String },
+}
+
+impl GlaconRecordError for VerifyError {
+    fn reason(&self) -> &'static str {
+        match self {
+            Self::Malformed { .. } => "malformed",
+            Self::TooSlow { .. } => "too_slow",
+        }
+    }
+}
+
 /// `common::Event` → [`Verified`]: ids starting with "slow" are invalid,
 /// "reject" events are malformed.
 #[derive(Clone)]
@@ -218,28 +238,25 @@ struct Verify;
 
 #[async_trait]
 impl GlaconCoreMiddleware<common::Event, Verified> for Verify {
+    type Error = VerifyError;
+
     async fn handle_data(
         &mut self,
         _: &BatchId,
         events: Vec<common::Event>,
-    ) -> Result<Vec<RecordResult<Verified>>, BoxError> {
+    ) -> Result<Vec<RecordResult<Verified, VerifyError>>, BoxError> {
         Ok(events
             .into_iter()
             .map(|e| match e.kind {
-                "reject" => Err(RecordError::new(
-                    "malformed",
-                    format!("{}: malformed", e.id),
-                )),
-                _ if e.id.starts_with("slow") => {
-                    Err(RecordError::new("too_slow", format!("{}: too slow", e.id)))
-                }
+                "reject" => Err(VerifyError::Malformed { id: e.id }),
+                _ if e.id.starts_with("slow") => Err(VerifyError::TooSlow { id: e.id }),
                 _ => Ok(Verified { id: e.id }),
             })
             .collect())
     }
 }
 
-/// Keeps the valid [`Verified`] records, or the errors.
+/// Keeps the valid [`Verified`] records, or the errors, matched by variant.
 #[derive(Clone)]
 struct VerifiedOutput {
     invalid: bool,
@@ -266,7 +283,7 @@ impl VerifiedOutput {
 }
 
 #[async_trait]
-impl GlaconCoreOutput<Verified> for VerifiedOutput {
+impl GlaconCoreOutput<Verified, VerifyError> for VerifiedOutput {
     type State = ();
 
     async fn init(&mut self, _: &OutputContext) -> Result<InitializedOutput<()>, BoxError> {
@@ -277,13 +294,14 @@ impl GlaconCoreOutput<Verified> for VerifiedOutput {
         &mut self,
         _: &mut (),
         _: &BatchId,
-        records: &[RecordResult<Verified>],
+        records: &[RecordResult<Verified, VerifyError>],
     ) -> Result<(), BoxError> {
         let mut rows = self.rows.lock().unwrap_or_else(PoisonError::into_inner);
         for record in records {
             match (self.invalid, record) {
                 (false, Ok(verified)) => rows.push(verified.id.clone()),
-                (true, Err(error)) => rows.push(error.message.clone()),
+                (true, Err(VerifyError::Malformed { id })) => rows.push(format!("{id}: malformed")),
+                (true, Err(VerifyError::TooSlow { id })) => rows.push(format!("{id}: too slow")),
                 _ => {}
             }
         }
@@ -297,11 +315,13 @@ struct Dropping;
 
 #[async_trait]
 impl GlaconCoreMiddleware<common::Event, common::Event> for Dropping {
+    type Error = Infallible;
+
     async fn handle_data(
         &mut self,
         _: &BatchId,
         events: Vec<common::Event>,
-    ) -> Result<Vec<RecordResult<common::Event>>, BoxError> {
+    ) -> Result<Vec<RecordResult<common::Event, Infallible>>, BoxError> {
         Ok(events
             .into_iter()
             .filter(|e| e.kind != "reject")

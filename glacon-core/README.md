@@ -104,13 +104,32 @@ record goes through, from startup to shutdown.
 
 ```rust
 use glacon_core::{
-    BatchId, BoxError, GlaconCoreMiddleware, RecordError, RecordResult, Route, RouteSettings,
-    async_trait,
+    BatchId, BoxError, GlaconCoreMiddleware, GlaconRecordError, RecordResult, Route,
+    RouteSettings, async_trait,
 };
 
 /// What the outputs get for a valid speed test.
 #[derive(Clone)]
 struct VerifiedSpeedTest(SpeedTest);
+
+/// What the outputs get for an invalid one: one variant per kind of failure.
+#[derive(Debug, thiserror::Error)]
+enum VerifyError {
+    #[error("{id}: upload too slow ({kbps} kbps)")]
+    TooSlow { id: String, kbps: u64 },
+    #[error("{id}: no location")]
+    NoLocation { id: String },
+}
+
+impl GlaconRecordError for VerifyError {
+    /// The `reason` label of `glacon_middleware_errors_total`.
+    fn reason(&self) -> &'static str {
+        match self {
+            Self::TooSlow { .. } => "too_slow",
+            Self::NoLocation { .. } => "no_location",
+        }
+    }
+}
 
 // Cloned for each input's processor.
 #[derive(Clone)]
@@ -118,18 +137,17 @@ struct VerifySpeedTest;
 
 #[async_trait]
 impl GlaconCoreMiddleware<SpeedTest, VerifiedSpeedTest> for VerifySpeedTest {
+    type Error = VerifyError;
+
     async fn handle_data(
         &mut self,
         _: &BatchId,
         tests: Vec<SpeedTest>,
-    ) -> Result<Vec<RecordResult<VerifiedSpeedTest>>, BoxError> {
+    ) -> Result<Vec<RecordResult<VerifiedSpeedTest, VerifyError>>, BoxError> {
         // One result per test, in order.
         Ok(tests
             .into_iter()
-            .map(|test| match test.verify() {
-                None => Ok(VerifiedSpeedTest(test)),
-                Some(reason) => Err(RecordError::new("invalid", format!("{}: {reason}", test.id))),
-            })
+            .map(|test| test.verify().map(|()| VerifiedSpeedTest(test))) // Result<_, VerifyError>
             .collect())
     }
 }
@@ -138,31 +156,37 @@ impl GlaconCoreMiddleware<SpeedTest, VerifiedSpeedTest> for VerifySpeedTest {
 let route = Route::builder("speedtests", RouteSettings::new("/data/speedtests"))
     .input("us", us_input)              // any GlaconCoreInput<SpeedTest>
     .input("eu", eu_input)
-    .middleware(VerifySpeedTest)        // SpeedTest -> RecordResult<VerifiedSpeedTest>
-    .output("verified", verified)       // any GlaconCoreOutput<VerifiedSpeedTest>,
+    .middleware(VerifySpeedTest)        // SpeedTest -> Result<VerifiedSpeedTest, VerifyError>
+    .output("verified", verified)       // any GlaconCoreOutput<VerifiedSpeedTest, VerifyError>,
     .output("rejected", rejected)       // keeping the Ok / the Err results
     .build()?;
 ```
 
 - The builder follows the data: inputs, then the middleware, then outputs.
-  The middleware sets the type outputs get, so the compiler enforces the
-  order. Without a middleware, outputs get the inputs' records unchanged
-  (`Passthrough`).
+  The middleware sets the record and error types outputs get, so the
+  compiler enforces the order. Without a middleware, outputs get the inputs'
+  records unchanged, and no error (`Passthrough`, whose error is
+  `Infallible`).
 - A route has one middleware, given as a value and cloned for each input's
   processor. Share state between the clones through an `Arc`; create what
   can't be cloned (a connection) in its `init`.
 - **Never drop: `Ok` or `Err`.** The middleware returns exactly one
-  `RecordResult<Out>` (`Result<Out, RecordError>`) per record it got, in
-  order; another count fails the route. A record that can't go on as data
+  `RecordResult<Out, Self::Error>` (`Result<Out, Self::Error>`) per record it
+  got, in order; another count fails the route
+  (`Error::MiddlewareResultCount`). A record that can't go on as data
   (malformed, a duplicate, invalid) becomes an `Err` saying why, and every
   output gets it: one writes the errors to a rejects table, another counts
   them, another ignores them. The middleware's own failure (its store is
   down) is the outer `Err`, and stops the route.
-- **A `RecordError` has a `reason` and a `message`.** The `reason` is a short
-  category from a fixed set (`"invalid"`, `"duplicate"`, `"malformed"`): it
-  labels `glacon_middleware_errors_total`, so it is a `&'static str`, never
-  built from the record. The `message` says what was wrong with this record;
-  it is logged and handed to the outputs, never a label.
+- **The middleware's errors are its own type.** It declares
+  `type Error`, any `GlaconRecordError` (typically an enum, one variant per
+  kind of failure, carrying what was wrong with the record), and outputs get
+  it as is, to match on. `GlaconRecordError::reason` maps each error to a
+  short category from a fixed set (`"too_slow"`, `"duplicate"`): it labels
+  `glacon_middleware_errors_total`, so it is a `&'static str`, never built
+  from the record. Its `Display` is logged, never a label. An output that
+  ignores errors implements `GlaconCoreOutput<R, E>` for any
+  `E: GlaconRecordError`.
 - Give every route its own `state_dir`. `RouteSettings` is serde-ready
   (`state_dir`, `processed_retention`).
 - `Route` names its tasks `input <name>`, `processor <name>` and
@@ -179,8 +203,8 @@ then `terminate`.
 | Stage | `init` | main hook | `terminate` |
 |---|---|---|---|
 | input | `GlaconCoreInput::init(&mut self, ctx)`: connect, build a poller, …; resume from `ctx.ledger()`; returns its `State` and an optional background task (`InitializedInput`) | `next_batch(&mut state)`: the next `Batch`, or `None` when done | — (the input and its state are dropped) |
-| middleware | `GlaconCoreMiddleware::init(&mut self, ctx)`: open a connection, … | `handle_data(&BatchId, Vec<In>) -> Vec<RecordResult<Out>>`: one result per record, `Ok` with the new record or `Err` with why not | release |
-| output | `GlaconCoreOutput::init(&mut self, ctx)`: connect, create the table, …; returns its `State`, an optional background task, and whether the destination already holds data (`InitializedOutput::with_existing_data`) | `handle_data(&mut state, &BatchId, &[RecordResult<R>])`: gets every result of the batch, writes what it keeps of the records and errors, `Ok` once durable. Optional: `already_written(&mut state, &BatchId)`, asked on replays | `terminate(&mut state)`: flush |
+| middleware | `GlaconCoreMiddleware::init(&mut self, ctx)`: open a connection, … | `handle_data(&BatchId, Vec<In>) -> Vec<RecordResult<Out, Self::Error>>`: one result per record, `Ok` with the new record or `Err` with why not | release |
+| output | `GlaconCoreOutput::init(&mut self, ctx)`: connect, create the table, …; returns its `State`, an optional background task, and whether the destination already holds data (`InitializedOutput::with_existing_data`) | `handle_data(&mut state, &BatchId, &[RecordResult<R, E>])`: gets every result of the batch, writes what it keeps of the records and errors, `Ok` once durable. Optional: `already_written(&mut state, &BatchId)`, asked on replays | `terminate(&mut state)`: flush |
 
 Inputs and outputs are **one trait each**, implemented by their
 configuration (what you give the builder). `init` builds the stage's `State`
@@ -373,7 +397,7 @@ and durations are in milliseconds.
 | `glacon_batch_processing_ms` | histogram | `input` | One batch through a processor: middleware, then hand-off |
 | `glacon_middleware_ms` | histogram | `input` | The middleware's part |
 | `glacon_output_handoff_ms` | histogram | `input` | Waiting for the outputs to take the batch: grows when an output is slower than the input |
-| `glacon_middleware_errors_total` | counter | `input`, `reason` | Records the middleware turned into an `Err`, by `RecordError::reason` |
+| `glacon_middleware_errors_total` | counter | `input`, `reason` | Records the middleware turned into an `Err`, by `GlaconRecordError::reason` |
 | `glacon_output_batches_total` | counter | `output` | Batches an output wrote |
 | `glacon_output_records_total` | counter | `output`, `kind` | Results an output wrote: `ok` records, `err` middleware errors (it may keep fewer) |
 | `glacon_output_write_ms` | histogram | `output` | One output's `handle_data` on one batch |

@@ -4,7 +4,8 @@
 
 use crate::common::{self, End, Journal, MemoryInput, MemoryOutput, batch, event};
 use glacon_core::{
-    BatchId, BoxError, Error, GlaconCoreMiddleware, RecordError, RecordResult, Route, async_trait,
+    BatchId, BoxError, Error, GlaconCoreMiddleware, GlaconRecordError, RecordResult, Route,
+    async_trait,
 };
 use std::{
     collections::{HashMap, HashSet},
@@ -95,16 +96,31 @@ struct Dedup {
     claimed_by: Arc<Mutex<HashMap<String, Claimer>>>,
 }
 
+/// A record whose id another batch, or this one, already claimed.
+#[derive(Debug, thiserror::Error)]
+#[error("{id}: duplicate")]
+struct Duplicate {
+    id: String,
+}
+
+impl GlaconRecordError for Duplicate {
+    fn reason(&self) -> &'static str {
+        "duplicate"
+    }
+}
+
 /// The batch that claimed a record: its input and key.
 type Claimer = (Arc<str>, String);
 
 #[async_trait]
 impl GlaconCoreMiddleware<common::Event, common::Event> for Dedup {
+    type Error = Duplicate;
+
     async fn handle_data(
         &mut self,
         batch: &BatchId,
         events: Vec<common::Event>,
-    ) -> Result<Vec<RecordResult<common::Event>>, BoxError> {
+    ) -> Result<Vec<RecordResult<common::Event, Duplicate>>, BoxError> {
         let mut claimed_by = self
             .claimed_by
             .lock()
@@ -120,10 +136,7 @@ impl GlaconCoreMiddleware<common::Event, common::Event> for Dedup {
                 if *claimer == this && in_batch.insert(e.id.clone()) {
                     Ok(e)
                 } else {
-                    Err(RecordError::new(
-                        "duplicate",
-                        format!("{}: duplicate", e.id),
-                    ))
+                    Err(Duplicate { id: e.id })
                 }
             })
             .collect())

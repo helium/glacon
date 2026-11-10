@@ -9,8 +9,9 @@
 use chrono::Utc;
 use glacon_core::{
     Batch, BatchId, BoxError, Error, GlaconCoreInput, GlaconCoreMiddleware, GlaconCoreOutput,
-    InitializedInput, InitializedOutput, InputContext, Ledger, MiddlewareContext, OutputContext,
-    RecordError, RecordResult, Route, RouteBuilder, RouteOutputs, RouteSettings, async_trait,
+    GlaconRecordError, InitializedInput, InitializedOutput, InputContext, Ledger,
+    MiddlewareContext, OutputContext, RecordResult, Route, RouteBuilder, RouteOutputs,
+    RouteSettings, async_trait,
     task_manager::{self, ManagedTask, TaskError, TaskFuture, TaskResult},
 };
 use std::{
@@ -416,7 +417,7 @@ fn take_one(n: &AtomicUsize) -> bool {
 }
 
 #[async_trait]
-impl GlaconCoreOutput<Event> for MemoryOutput {
+impl<E: GlaconRecordError> GlaconCoreOutput<Event, E> for MemoryOutput {
     type State = ();
 
     async fn init(&mut self, ctx: &OutputContext) -> Result<InitializedOutput<()>, BoxError> {
@@ -442,7 +443,7 @@ impl GlaconCoreOutput<Event> for MemoryOutput {
         &mut self,
         _: &mut (),
         batch: &BatchId,
-        records: &[RecordResult<Event>],
+        records: &[RecordResult<Event, E>],
     ) -> Result<(), BoxError> {
         if take_one(&self.failing_writes) {
             return Err(format!("{} write failure", self.name).into());
@@ -486,6 +487,19 @@ impl GlaconCoreOutput<Event> for MemoryOutput {
 
 // ---------------------------------------------------------------- middleware
 
+/// Why [`Checked`] rejected an event.
+#[derive(Debug, thiserror::Error)]
+#[error("{id}: rejected")]
+pub struct Rejected {
+    pub id: String,
+}
+
+impl GlaconRecordError for Rejected {
+    fn reason(&self) -> &'static str {
+        "rejected"
+    }
+}
+
 /// Rejects "reject" events and fails on "fail" ones; the rest pass
 /// unchanged.
 #[derive(Clone)]
@@ -496,6 +510,8 @@ pub struct Checked {
 
 #[async_trait]
 impl GlaconCoreMiddleware<Event, Event> for Checked {
+    type Error = Rejected;
+
     async fn init(&mut self, ctx: &MiddlewareContext) -> Result<(), BoxError> {
         self.input = ctx.input().to_string();
         self.journal.push(format!("init middleware {}", self.input));
@@ -506,14 +522,14 @@ impl GlaconCoreMiddleware<Event, Event> for Checked {
         &mut self,
         _: &BatchId,
         events: Vec<Event>,
-    ) -> Result<Vec<RecordResult<Event>>, BoxError> {
+    ) -> Result<Vec<RecordResult<Event, Rejected>>, BoxError> {
         if events.iter().any(|e| e.kind == "fail") {
             return Err("middleware failure".into());
         }
         Ok(events
             .into_iter()
             .map(|e| match e.kind {
-                "reject" => Err(RecordError::new("rejected", format!("{}: rejected", e.id))),
+                "reject" => Err(Rejected { id: e.id }),
                 _ => Ok(e),
             })
             .collect())
@@ -547,7 +563,7 @@ pub fn route(
     left: &MemoryOutput,
     right: &MemoryOutput,
     journal: &Journal,
-) -> RouteOutputs<Event, Event> {
+) -> RouteOutputs<Event, Event, Rejected> {
     let builder = inputs.into_iter().fold(
         Route::builder(name, settings(state, name)),
         |builder, input| builder.input(input.name, input),
@@ -561,7 +577,7 @@ pub fn route_from(
     left: &MemoryOutput,
     right: &MemoryOutput,
     journal: &Journal,
-) -> RouteOutputs<Event, Event> {
+) -> RouteOutputs<Event, Event, Rejected> {
     builder
         .middleware(Checked {
             input: String::new(),

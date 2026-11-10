@@ -1,6 +1,6 @@
 use super::middleware::{GlaconCoreMiddleware, MiddlewareContext};
 use crate::{
-    Error, ErrorChain, GlaconRecord, RecordResult, Result,
+    Error, ErrorChain, GlaconRecord, GlaconRecordError, RecordResult, Result,
     input::ReadBatch,
     ledger::InputLedger,
     lifecycle::{Initialized, Lifecycle, Terminate},
@@ -24,13 +24,15 @@ const IN_FLIGHT_EVERY: Duration = Duration::from_secs(60);
 
 /// An input's middleware with its context, the same before and after
 /// `init`.
-pub(crate) struct RouteMiddleware<In, Out> {
+pub(crate) struct RouteMiddleware<In, Out, E> {
     pub ctx: MiddlewareContext,
-    pub middleware: Box<dyn GlaconCoreMiddleware<In, Out>>,
+    pub middleware: Box<dyn GlaconCoreMiddleware<In, Out, Error = E>>,
 }
 
 #[async_trait::async_trait]
-impl<In: GlaconRecord, Out: GlaconRecord> Lifecycle for RouteMiddleware<In, Out> {
+impl<In: GlaconRecord, Out: GlaconRecord, E: GlaconRecordError> Lifecycle
+    for RouteMiddleware<In, Out, E>
+{
     type Started = Self;
 
     async fn init(mut self) -> Result<Initialized<Self>> {
@@ -51,7 +53,9 @@ impl<In: GlaconRecord, Out: GlaconRecord> Lifecycle for RouteMiddleware<In, Out>
 }
 
 #[async_trait::async_trait]
-impl<In: GlaconRecord, Out: GlaconRecord> Terminate for RouteMiddleware<In, Out> {
+impl<In: GlaconRecord, Out: GlaconRecord, E: GlaconRecordError> Terminate
+    for RouteMiddleware<In, Out, E>
+{
     async fn terminate(&mut self) -> Result {
         self.middleware
             .terminate()
@@ -61,9 +65,9 @@ impl<In: GlaconRecord, Out: GlaconRecord> Terminate for RouteMiddleware<In, Out>
 }
 
 /// Where a processor sends an output's records.
-pub(crate) struct OutputSender<R> {
+pub(crate) struct OutputSender<R, E> {
     pub name: Arc<str>,
-    pub deliveries: mpsc::Sender<Delivery<R>>,
+    pub deliveries: mpsc::Sender<Delivery<R, E>>,
 }
 
 /// The processor's task: run every batch of its input through the
@@ -79,12 +83,12 @@ pub(crate) struct OutputSender<R> {
 ///
 /// If the middleware fails or an output is gone, the input is stopped first:
 /// the middleware terminates only once its input did.
-pub(crate) async fn run<In: GlaconRecord, Out: GlaconRecord>(
-    mut route_middleware: RouteMiddleware<In, Out>,
+pub(crate) async fn run<In: GlaconRecord, Out: GlaconRecord, E: GlaconRecordError>(
+    mut route_middleware: RouteMiddleware<In, Out, E>,
     ledger: InputLedger,
     mut batches: mpsc::Receiver<ReadBatch<In>>,
     input_stopped: oneshot::Receiver<()>,
-    outputs: Vec<OutputSender<Out>>,
+    outputs: Vec<OutputSender<Out, E>>,
     shutdown: triggered::Listener,
 ) -> Result {
     let processed = process_all(
@@ -106,11 +110,11 @@ pub(crate) async fn run<In: GlaconRecord, Out: GlaconRecord>(
     processed.and(terminated)
 }
 
-async fn process_all<In: GlaconRecord, Out: GlaconRecord>(
-    route_middleware: &mut RouteMiddleware<In, Out>,
+async fn process_all<In: GlaconRecord, Out: GlaconRecord, E: GlaconRecordError>(
+    route_middleware: &mut RouteMiddleware<In, Out, E>,
     ledger: &InputLedger,
     batches: &mut mpsc::Receiver<ReadBatch<In>>,
-    outputs: &[OutputSender<Out>],
+    outputs: &[OutputSender<Out, E>],
     shutdown: &triggered::Listener,
 ) -> Result {
     let mut closed = false;
@@ -192,12 +196,12 @@ struct BatchErrors {
 }
 
 impl BatchErrors {
-    fn of<R>(results: &[RecordResult<R>]) -> Self {
+    fn of<R, E: GlaconRecordError>(results: &[RecordResult<R, E>]) -> Self {
         let mut errors = Self::default();
         for error in results.iter().filter_map(|r| r.as_ref().err()) {
-            *errors.by_reason.entry(error.reason).or_default() += 1;
+            *errors.by_reason.entry(error.reason()).or_default() += 1;
             if errors.first.is_none() {
-                errors.first = Some(error.message.clone());
+                errors.first = Some(ErrorChain(error).to_string());
             }
         }
         errors
@@ -220,11 +224,11 @@ impl BatchErrors {
 /// Returns `false` once an output stopped: it only does after failing, which
 /// the route reports. `newest` is the newest batch timestamp processed so
 /// far.
-async fn process<In: GlaconRecord, Out: GlaconRecord>(
-    route_middleware: &mut RouteMiddleware<In, Out>,
+async fn process<In: GlaconRecord, Out: GlaconRecord, E: GlaconRecordError>(
+    route_middleware: &mut RouteMiddleware<In, Out, E>,
     ledger: &InputLedger,
     batch: ReadBatch<In>,
-    outputs: &[OutputSender<Out>],
+    outputs: &[OutputSender<Out, E>],
     newest: &mut Option<DateTime<Utc>>,
 ) -> Result<bool> {
     let started = Instant::now();
@@ -243,15 +247,13 @@ async fn process<In: GlaconRecord, Out: GlaconRecord>(
         .map_err(|e| Error::middleware(route, input, e))?;
     let middleware_took = started.elapsed();
     if records.len() != read {
-        return Err(Error::middleware(
-            route,
-            input,
-            format!(
-                "returned {} results for the {read} records of batch {}",
-                records.len(),
-                id.key
-            ),
-        ));
+        return Err(Error::MiddlewareResultCount {
+            route: route.to_string(),
+            input: input.to_string(),
+            batch: id.key,
+            records: read,
+            results: records.len(),
+        });
     }
     let errors = BatchErrors::of(&records);
     for (reason, n) in &errors.by_reason {
@@ -262,15 +264,15 @@ async fn process<In: GlaconRecord, Out: GlaconRecord>(
             route = %route,
             input = %input,
             batch = %id.key,
-            reason = error.reason,
-            message = %error.message,
+            reason = error.reason(),
+            error = %ErrorChain(error),
             "record error"
         );
     }
 
     // Every output gets the batch, except, on a replay, those that already
     // took it. An empty batch goes to none.
-    let mut targets: Vec<&OutputSender<Out>> = Vec::new();
+    let mut targets: Vec<&OutputSender<Out, E>> = Vec::new();
     if !records.is_empty() {
         let delivered = if replayed {
             ledger.deliveries(&id).await?
