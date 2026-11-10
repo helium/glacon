@@ -10,7 +10,7 @@ use chrono::Utc;
 use glacon_core::{
     Batch, BatchId, BoxError, Error, GlaconCoreInput, GlaconCoreMiddleware, GlaconCoreOutput,
     InitializedInput, InitializedOutput, InputContext, Ledger, MiddlewareContext, OutputContext,
-    RecordResult, Route, RouteBuilder, RouteOutputs, RouteSettings, async_trait,
+    RecordError, RecordResult, Route, RouteBuilder, RouteOutputs, RouteSettings, async_trait,
     task_manager::{self, ManagedTask, TaskError, TaskFuture, TaskResult},
 };
 use std::{
@@ -454,7 +454,7 @@ impl GlaconCoreOutput<Event> for MemoryOutput {
                 match record {
                     Ok(e) if e.kind == self.name || e.kind == "both" => rows.push(e.id.clone()),
                     Ok(_) => {}
-                    Err(error) => errors.push(error.clone()),
+                    Err(error) => errors.push(error.to_string()),
                 }
             }
         }
@@ -513,7 +513,7 @@ impl GlaconCoreMiddleware<Event, Event> for Checked {
         Ok(events
             .into_iter()
             .map(|e| match e.kind {
-                "reject" => Err(format!("{}: rejected", e.id)),
+                "reject" => Err(RecordError::new("rejected", format!("{}: rejected", e.id))),
                 _ => Ok(e),
             })
             .collect())

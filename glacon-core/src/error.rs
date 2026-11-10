@@ -96,3 +96,66 @@ impl Error {
         }
     }
 }
+
+/// An error and every cause under it, `: `-separated, for logs: a plain
+/// `%error` shows only the top message, losing the cause (the HTTP or IO
+/// error behind a write failure, say).
+///
+/// A cause already ending its parent's message (as `#[error("...:
+/// {source}")]` does) is not repeated.
+///
+/// ```
+/// # use glacon_core::ErrorChain;
+/// # let error = std::io::Error::other("disk full");
+/// tracing::error!(error = %ErrorChain(&error), "write failed");
+/// ```
+pub struct ErrorChain<'a>(pub &'a (dyn std::error::Error + 'static));
+
+impl std::fmt::Display for ErrorChain<'_> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let mut shown = self.0.to_string();
+        let mut source = self.0.source();
+        while let Some(cause) = source {
+            let message = cause.to_string();
+            if !shown.ends_with(&message) {
+                shown.push_str(": ");
+                shown.push_str(&message);
+            }
+            source = cause.source();
+        }
+        f.write_str(&shown)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[derive(Debug, Error)]
+    #[error("{message}")]
+    struct Layer {
+        message: &'static str,
+        #[source]
+        source: Option<Box<Layer>>,
+    }
+
+    fn layer(message: &'static str, source: Option<Layer>) -> Layer {
+        Layer {
+            message,
+            source: source.map(Box::new),
+        }
+    }
+
+    #[test]
+    fn chain_shows_every_cause_once() {
+        let io = layer("broken pipe", None);
+        let http = layer("request failed", Some(io));
+        // Its message already ends with its source's.
+        let output = Error::output("r", "lake", http);
+        assert_eq!(
+            ErrorChain(&output).to_string(),
+            "route r: output lake: request failed: broken pipe"
+        );
+        assert_eq!(ErrorChain(&layer("alone", None)).to_string(), "alone");
+    }
+}

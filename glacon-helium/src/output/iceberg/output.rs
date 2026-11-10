@@ -91,23 +91,25 @@ where
         records: &[RecordResult<R>],
     ) -> Result<(), BoxError> {
         let mut rows = Vec::new();
+        let mut err_rows = 0;
         for record in records {
             match record {
                 Ok(record) => self.output.to_rows(record, &mut rows),
-                Err(error) => self.output.to_error_rows(error, &mut rows),
+                Err(error) => {
+                    let before = rows.len();
+                    self.output.to_error_rows(error, &mut rows);
+                    err_rows += rows.len() - before;
+                }
             }
         }
         if rows.is_empty() {
             return Ok(());
         }
-        let count = rows.len() as u64;
+        let ok_rows = rows.len() - err_rows;
         state.writer.queue_all(rows).await?;
-        metrics::output_counter(
-            metrics::OUTPUT_ROWS,
-            state.ctx.route(),
-            state.ctx.output(),
-            count,
-        );
+        let (route, output) = (state.ctx.route(), state.ctx.output());
+        metrics::output_rows(route, output, "ok", ok_rows as u64);
+        metrics::output_rows(route, output, "err", err_rows as u64);
         Ok(())
     }
 }

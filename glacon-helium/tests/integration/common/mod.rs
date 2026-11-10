@@ -11,7 +11,7 @@ pub use harness::Harness;
 use chrono::{DateTime, Duration, Utc};
 use glacon_helium::{
     BatchId, BoxError, FileMeta, FileStoreInput, GlaconCoreMiddleware, GlaconInput, GlaconOutput,
-    IcebergOutput, RecordResult, Route, RouteBuilder, RouteOutputs, async_trait,
+    IcebergOutput, RecordError, RecordResult, Route, RouteBuilder, RouteOutputs, async_trait,
     helium_iceberg::{FieldDefinition, PartitionDefinition, TableDefinition},
     task_manager::ManagedTask,
 };
@@ -252,9 +252,9 @@ impl GlaconOutput<Event> for RejectsTable {
 
     fn to_rows(&self, _: &Event, _: &mut Vec<RejectRow>) {}
 
-    fn to_error_rows(&self, error: &str, rows: &mut Vec<RejectRow>) {
+    fn to_error_rows(&self, error: &RecordError, rows: &mut Vec<RejectRow>) {
         rows.push(RejectRow {
-            error: error.to_string(),
+            error: error.message.clone(),
             rejected_at: Utc::now(),
         });
     }
@@ -277,7 +277,7 @@ impl GlaconCoreMiddleware<Event, Event> for RejectDrop {
         Ok(events
             .into_iter()
             .map(|e| match e.kind {
-                Kind::Drop => Err(format!("{}: rejected", e.id)),
+                Kind::Drop => Err(RecordError::new("rejected", format!("{}: rejected", e.id))),
                 _ => Ok(e),
             })
             .collect())

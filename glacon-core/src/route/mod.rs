@@ -27,7 +27,8 @@ pub use fresh_state::FreshState;
 pub use settings::RouteSettings;
 
 use crate::{
-    BoxError, Error, GlaconRecord, InputContext, MiddlewareContext, OutputContext, Result,
+    BoxError, Error, ErrorChain, GlaconRecord, InputContext, MiddlewareContext, OutputContext,
+    Result,
     input::{self, InitInput, PendingInput, RouteInput},
     ledger::{InputLedger, Ledger},
     lifecycle::{Initialized, init_all, terminate_all},
@@ -81,15 +82,26 @@ async fn run<In: GlaconRecord, Out: GlaconRecord>(
     parts: RouteParts<In, Out>,
     shutdown: triggered::Listener,
 ) -> Result<(), BoxError> {
-    let tasks = up(&route, parts).await?;
+    let tasks = match up(&route, parts).await {
+        Ok(tasks) => tasks,
+        Err(error) => {
+            tracing::error!(route = %route, error = %ErrorChain(&error), "route failed to start");
+            return Err(error.into());
+        }
+    };
     tracing::info!(route = %route, "route started");
 
-    let result = Box::new(tasks).start_task(shutdown).await;
+    let result = Box::new(tasks)
+        .start_task(shutdown)
+        .await
+        .map_err(unwrap_task_error);
     match &result {
         Ok(()) => tracing::info!(route = %route, "route stopped"),
-        Err(error) => tracing::error!(route = %route, %error, "route failed"),
+        Err(error) => {
+            tracing::error!(route = %route, error = %ErrorChain(&**error), "route failed")
+        }
     }
-    result.map_err(unwrap_task_error)
+    result
 }
 
 /// Open the ledger, initialize every stage, layer by layer, then wire them
@@ -107,8 +119,18 @@ async fn up<In: GlaconRecord, Out: GlaconRecord>(
         fresh_state,
     } = parts;
 
+    tracing::info!(
+        route = %route,
+        state_dir = %settings.state_dir.display(),
+        processed_retention = %humantime::format_duration(settings.processed_retention),
+        inputs = %inputs.iter().map(|(name, _)| name.as_str()).collect::<Vec<_>>().join(","),
+        outputs = %outputs.iter().map(|(name, _)| name.as_str()).collect::<Vec<_>>().join(","),
+        fresh_state = ?fresh_state,
+        "starting route"
+    );
     let ledger = Arc::new(Ledger::open(&settings.state_dir).await?);
     let fresh = ledger.is_fresh().await?;
+    tracing::info!(route = %route, fresh, "ledger opened");
 
     let outputs = init_all(
         outputs

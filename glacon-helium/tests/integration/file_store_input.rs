@@ -122,6 +122,20 @@ async fn input_metrics_count_batches_and_records() -> anyhow::Result<()> {
     assert_eq!(common::metrics::counter(m::PROCESSED_BATCHES, &input)?, 3);
     assert_eq!(common::metrics::counter(m::RECORDS_DECODED, &input)?, 3);
     assert!(common::metrics::gauge_exists(m::BATCH_LAG, &input)?);
+    assert!(common::metrics::gauge_exists(
+        m::LAST_BATCH_TIMESTAMP,
+        &input
+    )?);
+    assert!(common::metrics::histogram_exists(
+        m::MIDDLEWARE_DURATION,
+        &input
+    )?);
+    let output = [("route", "metered"), ("output", common::EVENTS)];
+    assert_eq!(common::metrics::counter(m::OUTPUT_BATCHES, &output)?, 3);
+    assert!(common::metrics::histogram_exists(
+        m::OUTPUT_WRITE_DURATION,
+        &output
+    )?);
     h.cleanup().await?;
     Ok(())
 }
