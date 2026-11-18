@@ -1,0 +1,331 @@
+//! The middleware: records from N inputs, transformed by each input's
+//! middleware (changing their type, rejecting some), then kept or not by
+//! each of M outputs, which also get the rejections; a failing middleware,
+//! or one not returning a result per record, fails the route. Deduplication
+//! has its own file, `middleware_dedup.rs`.
+
+use crate::common::{self, End, Journal, MemoryInput, MemoryOutput, batch, event};
+use glacon_core::{
+    BatchId, BoxError, Error, GlaconCoreMiddleware, GlaconCoreOutput, GlaconRecordError,
+    InitializedOutput, OutputContext, RecordResult, Route, async_trait,
+};
+use std::{
+    convert::Infallible,
+    sync::{Arc, Mutex, PoisonError},
+};
+
+// ---------------------------------------------------------------- transforming
+
+#[tokio::test]
+async fn routes_records_to_outputs() -> anyhow::Result<()> {
+    let state = tempfile::tempdir()?;
+    let journal = Journal::default();
+    let (left, right) = (
+        MemoryOutput::new(common::LEFT, &journal),
+        MemoryOutput::new(common::RIGHT, &journal),
+    );
+    let us = MemoryInput::new(
+        "us",
+        vec![
+            batch(
+                "us.1",
+                vec![
+                    event("l1", "left"),
+                    event("b1", "both"),
+                    event("d1", "reject"),
+                ],
+            ),
+            batch("us.2", vec![event("r1", "right")]),
+        ],
+        End::Return,
+        &journal,
+    );
+    let eu = MemoryInput::new(
+        "eu",
+        vec![batch(
+            "eu.1",
+            vec![event("l2", "left"), event("b2", "both")],
+        )],
+        End::Return,
+        &journal,
+    );
+
+    let route = common::route(
+        "routing",
+        state.path(),
+        vec![us, eu],
+        &left,
+        &right,
+        &journal,
+    )
+    .build()?;
+    common::run(route).await?;
+
+    assert_eq!(left.rows(), ["b1", "b2", "l1", "l2"]);
+    assert_eq!(right.rows(), ["b1", "b2", "r1"]);
+    // Every output gets the rejections too.
+    assert_eq!(left.errors(), ["d1: rejected"]);
+    assert_eq!(right.errors(), ["d1: rejected"]);
+    Ok(())
+}
+
+#[tokio::test]
+async fn a_middleware_can_change_the_record_type() -> anyhow::Result<()> {
+    let state = tempfile::tempdir()?;
+    let journal = Journal::default();
+    let input = MemoryInput::new(
+        "us",
+        vec![batch(
+            "us.1",
+            vec![
+                event("fast1", "both"),
+                event("slow1", "both"),
+                event("broken", "reject"),
+                event("fast2", "both"),
+            ],
+        )],
+        End::Return,
+        &journal,
+    );
+    let (verified, invalid) = (VerifiedOutput::new(false), VerifiedOutput::new(true));
+
+    let route = Route::builder("verify", common::settings(state.path(), "verify"))
+        .input("us", input)
+        .middleware(Verify)
+        .output("verified", verified.clone())
+        .output("invalid", invalid.clone())
+        .build()?;
+    common::run(route).await?;
+
+    assert_eq!(verified.rows(), ["fast1", "fast2"]);
+    assert_eq!(invalid.rows(), ["broken: malformed", "slow1: too slow"]);
+    Ok(())
+}
+
+// ---------------------------------------------------------------- rejecting and failing
+
+#[tokio::test]
+async fn a_batch_of_only_rejections_still_reaches_the_outputs() -> anyhow::Result<()> {
+    let state = tempfile::tempdir()?;
+    let journal = Journal::default();
+    let (left, right) = common::outputs(&journal);
+    let input = MemoryInput::new(
+        "us",
+        vec![batch("us.1", vec![event("x", "reject")])],
+        End::Return,
+        &journal,
+    );
+
+    let route = common::route(
+        "rejected",
+        state.path(),
+        vec![input],
+        &left,
+        &right,
+        &journal,
+    )
+    .build()?;
+    common::run(route).await?;
+
+    for output in [&left, &right] {
+        assert_eq!(output.batches(), ["us.1"]);
+        assert!(output.rows().is_empty());
+        assert_eq!(output.errors(), ["x: rejected"]);
+    }
+    let ledger = common::ledger(state.path(), "rejected").await?;
+    assert!(ledger.is_done("us", "us.1").await?);
+    common::assert_nothing_in_flight(state.path(), "rejected").await
+}
+
+#[tokio::test]
+async fn a_middleware_dropping_records_fails_the_route() -> anyhow::Result<()> {
+    let state = tempfile::tempdir()?;
+    let journal = Journal::default();
+    let output = MemoryOutput::new(common::LEFT, &journal);
+    let input = MemoryInput::new(
+        "us",
+        vec![batch(
+            "us.1",
+            vec![event("a", "both"), event("x", "reject")],
+        )],
+        End::HoldOpen,
+        &journal,
+    );
+
+    let route = Route::builder("dropping", common::settings(state.path(), "dropping"))
+        .input("us", input)
+        .middleware(Dropping)
+        .output(common::LEFT, output.clone())
+        .build()?;
+    let err = common::run(route).await.expect_err("must fail");
+
+    let err = common::route_error(&err);
+    assert!(
+        matches!(
+            err,
+            Error::MiddlewareResultCount { input, batch, records: 2, results: 1, .. }
+                if input == "us" && batch == "us.1"
+        ),
+        "{err}"
+    );
+    assert!(output.batches().is_empty());
+    Ok(())
+}
+
+#[tokio::test]
+async fn a_failing_middleware_fails_the_route() -> anyhow::Result<()> {
+    let state = tempfile::tempdir()?;
+    let journal = Journal::default();
+    let (left, right) = common::outputs(&journal);
+    let input = MemoryInput::new(
+        "us",
+        vec![batch("us.1", vec![event("x", "fail")])],
+        End::HoldOpen,
+        &journal,
+    );
+
+    let route = common::route(
+        "middleware",
+        state.path(),
+        vec![input],
+        &left,
+        &right,
+        &journal,
+    )
+    .build()?;
+    let err = common::run(route).await.expect_err("must fail");
+
+    let err = common::route_error(&err);
+    assert!(
+        matches!(err, Error::Middleware { input, .. } if input == "us"),
+        "{err}"
+    );
+    common::assert_down_order(&journal);
+    Ok(())
+}
+
+// ---------------------------------------------------------------- helpers
+
+/// A speed test once verified: the middleware decides, every output sees
+/// the result and keeps what it wants.
+#[derive(Debug, Clone)]
+struct Verified {
+    id: String,
+}
+
+/// Why [`Verify`] rejected an event.
+#[derive(Debug, thiserror::Error)]
+enum VerifyError {
+    #[error("{id}: malformed")]
+    Malformed { id: String },
+    #[error("{id}: too slow")]
+    TooSlow { id: String },
+}
+
+impl GlaconRecordError for VerifyError {
+    fn reason(&self) -> &'static str {
+        match self {
+            Self::Malformed { .. } => "malformed",
+            Self::TooSlow { .. } => "too_slow",
+        }
+    }
+}
+
+/// `common::Event` → [`Verified`]: ids starting with "slow" are invalid,
+/// "reject" events are malformed.
+#[derive(Clone)]
+struct Verify;
+
+#[async_trait]
+impl GlaconCoreMiddleware<common::Event, Verified> for Verify {
+    type Error = VerifyError;
+
+    async fn handle_data(
+        &mut self,
+        _: &BatchId,
+        events: Vec<common::Event>,
+    ) -> Result<Vec<RecordResult<Verified, VerifyError>>, BoxError> {
+        Ok(events
+            .into_iter()
+            .map(|e| match e.kind {
+                "reject" => Err(VerifyError::Malformed { id: e.id }),
+                _ if e.id.starts_with("slow") => Err(VerifyError::TooSlow { id: e.id }),
+                _ => Ok(Verified { id: e.id }),
+            })
+            .collect())
+    }
+}
+
+/// Keeps the valid [`Verified`] records, or the errors, matched by variant.
+#[derive(Clone)]
+struct VerifiedOutput {
+    invalid: bool,
+    rows: Arc<Mutex<Vec<String>>>,
+}
+
+impl VerifiedOutput {
+    fn new(invalid: bool) -> Self {
+        Self {
+            invalid,
+            rows: Default::default(),
+        }
+    }
+
+    fn rows(&self) -> Vec<String> {
+        let mut rows = self
+            .rows
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .clone();
+        rows.sort();
+        rows
+    }
+}
+
+#[async_trait]
+impl GlaconCoreOutput<Verified, VerifyError> for VerifiedOutput {
+    type State = ();
+
+    async fn init(&mut self, _: &OutputContext) -> Result<InitializedOutput<()>, BoxError> {
+        Ok(InitializedOutput::new(()))
+    }
+
+    async fn handle_data(
+        &mut self,
+        _: &mut (),
+        _: &BatchId,
+        records: &[RecordResult<Verified, VerifyError>],
+    ) -> Result<(), BoxError> {
+        let mut rows = self.rows.lock().unwrap_or_else(PoisonError::into_inner);
+        for record in records {
+            match (self.invalid, record) {
+                (false, Ok(verified)) => rows.push(verified.id.clone()),
+                (true, Err(VerifyError::Malformed { id })) => rows.push(format!("{id}: malformed")),
+                (true, Err(VerifyError::TooSlow { id })) => rows.push(format!("{id}: too slow")),
+                _ => {}
+            }
+        }
+        Ok(())
+    }
+}
+
+/// Leaves out every "reject" event instead of returning an error for it.
+#[derive(Clone)]
+struct Dropping;
+
+#[async_trait]
+impl GlaconCoreMiddleware<common::Event, common::Event> for Dropping {
+    type Error = Infallible;
+
+    async fn handle_data(
+        &mut self,
+        _: &BatchId,
+        events: Vec<common::Event>,
+    ) -> Result<Vec<RecordResult<common::Event, Infallible>>, BoxError> {
+        Ok(events
+            .into_iter()
+            .filter(|e| e.kind != "reject")
+            .map(Ok)
+            .collect())
+    }
+}

@@ -1,0 +1,83 @@
+# cargo-deny: run by CI (`cargo deny check`), and locally the same way.
+# https://embarkstudios.github.io/cargo-deny/
+
+# Check only what is built: Linux in production and CI, macOS for development.
+[graph]
+targets = [
+  "x86_64-unknown-linux-gnu",
+  "aarch64-unknown-linux-gnu",
+  "aarch64-apple-darwin",
+]
+
+# Security advisories (RustSec): vulnerable or unsound crates, and yanked
+# versions, fail the check. A finding to accept goes in `ignore`, with why.
+[advisories]
+yanked = "deny"
+# Unmaintained crates fail only when the workspace depends on them directly:
+# the ones deep in the oracles / AWS / iceberg stack have no fix we can make.
+unmaintained = "workspace"
+# Each one comes through oracles (file-store, helium-iceberg) and needs a
+# release there, or upstream, to go away. Drop the line once it does: cargo
+# deny warns about ignores that no longer match.
+ignore = [
+  # file-store → aws-config / aws-sdk-s3, legacy hyper 0.14 client
+  { id = "RUSTSEC-2026-0098", reason = "rustls-webpki 0.101, via aws-smithy's legacy hyper 0.14 client (file-store)" },
+  { id = "RUSTSEC-2026-0099", reason = "rustls-webpki 0.101, via aws-smithy's legacy hyper 0.14 client (file-store)" },
+  { id = "RUSTSEC-2026-0104", reason = "rustls-webpki 0.101, via aws-smithy's legacy hyper 0.14 client (file-store)" },
+  { id = "RUSTSEC-2026-0382", reason = "rustls-webpki 0.101, via aws-smithy's legacy hyper 0.14 client (file-store)" },
+  { id = "RUSTSEC-2026-0346", reason = "rustls 0.21, via aws-smithy's legacy hyper 0.14 client (file-store)" },
+  { id = "RUSTSEC-2026-0349", reason = "rustls 0.21, via aws-smithy's legacy hyper 0.14 client (file-store)" },
+  { id = "RUSTSEC-2026-0258", reason = "h2 0.3, via aws-smithy's legacy hyper 0.14 client (file-store)" },
+  { id = "RUSTSEC-2026-0387", reason = "crypto-bigint 0.5, via aws-sigv4's p256 (file-store)" },
+  # helium-iceberg → iceberg / opendal / parquet
+  { id = "RUSTSEC-2026-0194", reason = "quick-xml 0.37 / 0.38, via opendal and reqsign (helium-iceberg)" },
+  { id = "RUSTSEC-2026-0195", reason = "quick-xml 0.37 / 0.38, via opendal and reqsign (helium-iceberg)" },
+  { id = "RUSTSEC-2026-0435", reason = "thrift 0.17, via parquet (helium-iceberg)" },
+  # glacon-core → sqlx (the ledger)
+  # sqlx-sqlite 0.9.0, the latest, caps libsqlite3-sys below 0.38, and the fix
+  # is in 0.39: drop this once a sqlx release allows it. The bug needs a
+  # database and -wal written by a less trusted party; glacon only opens the
+  # state.db it creates and writes itself.
+  { id = "RUSTSEC-2026-0459", reason = "bundled SQLite < 3.54 in libsqlite3-sys 0.30, via sqlx-sqlite 0.9 (ledger); glacon only opens its own state.db" },
+]
+
+# Permissive licenses only. A crate offering a choice (MIT OR Apache-2.0) passes
+# if one of them is allowed.
+[licenses]
+allow = [
+  "Apache-2.0",
+  "Apache-2.0 WITH LLVM-exception",
+  "BSD-2-Clause",
+  "BSD-3-Clause",
+  "BSL-1.0",
+  "CC0-1.0",
+  "CDLA-Permissive-2.0",
+  "ISC",
+  "MIT",
+  "MIT-0",
+  "Unicode-3.0",
+  "Unlicense",
+  "Zlib",
+]
+confidence-threshold = 0.8
+
+# The workspace crates are not published.
+[licenses.private]
+ignore = true
+
+[bans]
+# Duplicate versions are allowed: the iceberg / AWS / arrow stack brings ~40,
+# outside our control, and warning about them would bury the warnings that
+# matter (an advisory ignore that no longer matches).
+multiple-versions = "allow"
+wildcards = "deny"
+allow-wildcard-paths = true
+
+# crates.io, and git dependencies from the helium organization only (oracles).
+[sources]
+unknown-registry = "deny"
+unknown-git = "deny"
+allow-registry = ["https://github.com/rust-lang/crates.io-index"]
+
+[sources.allow-org]
+github = ["helium"]

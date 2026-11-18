@@ -1,0 +1,240 @@
+name: CI
+
+on:
+  pull_request:
+    branches: ["main"]
+  push:
+    branches: ["main"]
+  workflow_dispatch:
+
+# Every job pulls the base image; only build-base pushes it.
+permissions:
+  contents: read
+  packages: read
+
+jobs:
+  compute-base-build-tag:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    outputs:
+      image_tag: ${{ steps.out.outputs.tag }}
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Create Tag
+        id: out
+        run: echo "tag=${{ hashFiles('Dockerfile','rust-toolchain.toml') }}" >> "$GITHUB_OUTPUT"
+
+  # The base image is CI's toolchain, built once per Dockerfile and
+  # rust-toolchain.toml and cached in ghcr.io.
+  build-base:
+    needs: compute-base-build-tag
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    permissions:
+      contents: read
+      packages: write
+    env:
+      CACHE_HIT: false
+      IMAGE: ghcr.io/${{ github.repository }}/base:${{ needs.compute-base-build-tag.outputs.image_tag }}
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Log in to GitHub Container Registry
+        uses: docker/login-action@81c6f93d4bc991e510b342a00b419b3bb4efc5c6 # v4.7.0
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - name: Pull Cached base Image
+        run: |
+          if docker manifest inspect "$IMAGE" > /dev/null 2>&1; then
+            echo "CACHE_HIT=true" >> $GITHUB_ENV
+          else
+            echo "CACHE_HIT=false" >> $GITHUB_ENV
+          fi
+      - name: Set up Docker Buildx
+        if: env.CACHE_HIT == 'false'
+        uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
+      - name: Build and Push base Image (if not cached)
+        if: env.CACHE_HIT == 'false'
+        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
+        with:
+          context: .
+          file: Dockerfile
+          target: base
+          push: true
+          tags: ${{ env.IMAGE }}
+
+  fmt:
+    needs: [compute-base-build-tag, build-base]
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    container:
+      image: ghcr.io/${{ github.repository }}/base:${{ needs.compute-base-build-tag.outputs.image_tag }}
+      options: --user 1001:1001
+    concurrency:
+      group: ${{ github.workflow }}-${{ github.ref }}-fmt
+      cancel-in-progress: true
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Check formatting
+        run: cargo fmt --all -- --check
+
+  clippy:
+    needs: [compute-base-build-tag, build-base]
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    container:
+      image: ghcr.io/${{ github.repository }}/base:${{ needs.compute-base-build-tag.outputs.image_tag }}
+      options: --user 1001:1001
+    concurrency:
+      group: ${{ github.workflow }}-${{ github.ref }}-clippy
+      cancel-in-progress: true
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Cache Cargo Target Directory
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: target
+          key: clippy-base-${{ needs.compute-base-build-tag.outputs.image_tag }}-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            clippy-base-${{ needs.compute-base-build-tag.outputs.image_tag }}-
+      - name: Clippy
+        run: cargo clippy --workspace --all-targets --locked -- -Dclippy::all -D warnings
+      - name: Docs
+        env:
+          RUSTDOCFLAGS: -D warnings
+        run: cargo doc --workspace --no-deps --locked
+
+  # Advisories, licenses and sources (deny.toml), and unused dependencies.
+  dependencies:
+    needs: [compute-base-build-tag, build-base]
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    container:
+      image: ghcr.io/${{ github.repository }}/base:${{ needs.compute-base-build-tag.outputs.image_tag }}
+      options: --user 1001:1001
+    concurrency:
+      group: ${{ github.workflow }}-${{ github.ref }}-dependencies
+      cancel-in-progress: true
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: cargo deny
+        run: cargo deny --locked check
+      - name: cargo shear
+        run: cargo shear
+
+  # Every test of the workspace in one job, against the services
+  # docker-compose.yml runs locally.
+  tests:
+    needs: [compute-base-build-tag, build-base]
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    container:
+      image: ghcr.io/${{ github.repository }}/base:${{ needs.compute-base-build-tag.outputs.image_tag }}
+      options: --user 1001:1001
+    concurrency:
+      group: ${{ github.workflow }}-${{ github.ref }}-tests
+      cancel-in-progress: true
+    services:
+      rustfs:
+        image: rustfs/rustfs:1.0.0-alpha.90
+        ports:
+          - 9000:9000
+          - 4566:9000
+        env:
+          RUSTFS_CONSOLE_ENABLE: false
+          RUSTFS_ACCESS_KEY: admin
+          RUSTFS_SECRET_KEY: admin
+      polaris:
+        image: apache/polaris:1.7.0
+        env:
+          POLARIS_PERSISTENCE_TYPE: in-memory
+          POLARIS_BOOTSTRAP_CREDENTIALS: POLARIS,root,s3cr3t
+          POLARIS_REALM_CONTEXT_REALMS: POLARIS
+          QUARKUS_OTEL_SDK_DISABLED: "true"
+          POLARIS_FEATURES__ALLOW_INSECURE_STORAGE_TYPES: "true"
+          POLARIS_FEATURES__SUPPORTED_CATALOG_STORAGE_TYPES: '["S3"]'
+          POLARIS_READINESS__IGNORE_SEVERE_ISSUES: "true"
+          POLARIS_FEATURES__DROP_WITH_PURGE_ENABLED: "true"
+          AWS_REGION: us-west-2
+          AWS_ACCESS_KEY_ID: admin
+          AWS_SECRET_ACCESS_KEY: admin
+        ports:
+          - 8181:8181
+      trino:
+        image: trinodb/trino:483
+        env:
+          AWS_ACCESS_KEY_ID: admin
+          AWS_SECRET_ACCESS_KEY: admin
+          CATALOG_MANAGEMENT: dynamic
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Cache Cargo Target Directory
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: target
+          key: tests-base-${{ needs.compute-base-build-tag.outputs.image_tag }}-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            tests-base-${{ needs.compute-base-build-tag.outputs.image_tag }}-
+
+      # The bucket every test catalog stores its tables in (the rustfs-init
+      # service of docker-compose.yml).
+      - name: Rustfs init
+        timeout-minutes: 1
+        env:
+          AWS_ACCESS_KEY_ID: admin
+          AWS_SECRET_ACCESS_KEY: admin
+          AWS_DEFAULT_REGION: us-east-1
+        run: |
+          until curl -sf http://rustfs:9000/health > /dev/null 2>&1; do
+            echo "...waiting for Rustfs..."
+            sleep 2
+          done
+          aws --endpoint-url http://rustfs:9000 s3 mb s3://iceberg-test 2>/dev/null \
+            || echo "bucket iceberg-test already exists"
+
+      - name: Wait for Trino
+        timeout-minutes: 1
+        run: |
+          until curl -sf http://trino:8080/v1/info | grep -q '"starting":false'; do
+            echo "...waiting for Trino..."
+            sleep 2
+          done
+          echo "Trino is up"
+
+      - name: Run tests
+        env:
+          AWSLOCAL_HOST: rustfs
+          AWSLOCAL_PORT: 9000
+          S3_QUALIFIED_HOST: rustfs
+          S3_LOCAL_HOST: rustfs
+          CATALOG_QUALIFIED_HOST: polaris
+          CATALOG_LOCAL_HOST: polaris
+          TRINO_HOST: trino
+        run: cargo nextest run --workspace --locked --profile ci
+
+      - name: Upload JUnit report
+        if: ${{ !cancelled() }}
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: junit
+          path: target/nextest/ci/junit.xml

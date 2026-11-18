@@ -1,0 +1,16 @@
+[package]
+name = "glacon-test-proto"
+description = "Protobuf messages used only by glacon's tests"
+version.workspace = true
+edition.workspace = true
+publish.workspace = true
+
+[dependencies]
+prost.workspace = true
+
+[build-dependencies]
+prost-build = "0.14"
+
+# prost is used by the generated code, included from OUT_DIR: invisible to shear.
+[package.metadata.cargo-shear]
+ignored = ["prost"]

@@ -1,0 +1,16 @@
+# Integration tests share one Polaris and one Trino; limit how many run at once.
+[test-groups]
+integration = { max-threads = 4 }
+
+[[profile.default.overrides]]
+filter = "package(glacon-helium) & binary(integration)"
+test-group = "integration"
+
+# CI (`--profile ci`): report every failure, never wait on a hung test, and
+# write a JUnit report (target/nextest/ci/junit.xml).
+[profile.ci]
+fail-fast = false
+slow-timeout = { period = "60s", terminate-after = 3 }
+
+[profile.ci.junit]
+path = "junit.xml"

@@ -1,0 +1,24 @@
+# Weekly updates, one grouped PR per ecosystem. The cooldown leaves a new
+# release a week to be yanked or reported before it is proposed.
+version: 2
+updates:
+  # Actions are pinned by SHA; Dependabot bumps the SHA and its `# vX` comment.
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: weekly
+    cooldown:
+      default-days: 7
+    groups:
+      actions:
+        patterns: ["*"]
+
+  - package-ecosystem: cargo
+    directory: /
+    schedule:
+      interval: weekly
+    cooldown:
+      default-days: 7
+    groups:
+      cargo:
+        update-types: [minor, patch]

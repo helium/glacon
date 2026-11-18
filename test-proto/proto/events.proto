@@ -1,0 +1,29 @@
+syntax = "proto3";
+
+package glacon.test;
+
+// First event format. One value per event.
+message EventV1 {
+  // Dedup key. Empty means "no key": the event is never deduplicated.
+  string id = 1;
+  uint64 timestamp_ms = 2;
+  string kind = 3;
+  int64 value = 4;
+}
+
+// Second event format with a different shape, decoded into the same record
+// as EventV1 so a route can fan in both.
+message EventV2 {
+  enum Kind {
+    KIND_UNSPECIFIED = 0;
+    KIND_A = 1;
+    KIND_B = 2;
+    KIND_BOTH = 3;
+    KIND_DROP = 4;
+  }
+
+  string event_id = 1;
+  uint64 occurred_at_ms = 2;
+  Kind kind = 3;
+  repeated int64 values = 4;
+}

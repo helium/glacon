@@ -1,0 +1,33 @@
+# Scans the full git history for secrets (API keys, tokens, private keys,
+# ...). Only verified ones, confirmed live against their service, are reported.
+
+name: TruffleHog Secret Scan
+
+on:
+  pull_request:
+    branches: [main]
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  trufflehog:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      contents: read
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0 # Need full history for TruffleHog
+          persist-credentials: false
+
+      - name: TruffleHog OSS
+        uses: trufflesecurity/trufflehog@31ce31ee1abbcc7dc8eee5764c17121c3044c8b2 # v3.99.7
+        with:
+          path: ./
+          extra_args: --debug --results verified
