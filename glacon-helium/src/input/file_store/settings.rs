@@ -1,9 +1,9 @@
 use chrono::{DateTime, Utc};
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use std::time::Duration;
 
 /// One S3 bucket feeding a route.
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct FileStoreInputSettings {
     pub bucket: file_store::BucketSettings,
 
@@ -57,6 +57,24 @@ mod tests {
         assert_eq!(s.poll_duration, Some(humantime::parse_duration("5s")?));
         assert_eq!(s.idle_timeout, Some(humantime::parse_duration("1 minute")?));
         assert_eq!(s.offset, None);
+        Ok(())
+    }
+
+    #[test]
+    fn serializing_leaves_out_the_bucket_keys() -> anyhow::Result<()> {
+        let s: FileStoreInputSettings = serde_json::from_str(
+            r#"{
+                "bucket": {"bucket": "b", "access_key_id": "KEY-ID", "secret_access_key": "SECRET"},
+                "start_after": "2026-01-01T00:00:00Z",
+                "offset": "30m"
+            }"#,
+        )?;
+
+        let printed = serde_json::to_string(&s)?;
+        for secret in ["KEY-ID", "SECRET"] {
+            assert!(!printed.contains(secret), "{secret} leaked: {printed}");
+        }
+        assert!(printed.contains(r#""offset":"30m""#), "{printed}");
         Ok(())
     }
 }
