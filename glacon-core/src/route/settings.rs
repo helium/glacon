@@ -1,8 +1,8 @@
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use std::{path::PathBuf, time::Duration};
 
 /// Route-wide settings.
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct RouteSettings {
     /// Directory holding the route's ledger (`state.db`). MUST be durable (a
     /// mounted volume): it is the only record of what was delivered.
