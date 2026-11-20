@@ -1833,7 +1833,7 @@ dependencies = [
 [[package]]
 name = "file-store"
 version = "0.1.0"
-source = "git+https://github.com/helium/oracles?branch=main#de099271df07a7b06bb90665f2edbce362b8faf7"
+source = "git+https://github.com/helium/oracles?branch=main#27042b7a015ba2d8bff53918248021c0a4fccbb4"
 dependencies = [
  "async-compression",
  "async-trait",
@@ -2323,7 +2323,7 @@ checksum = "2304e00983f87ffb38b55b444b5e3b60a884b5d30c0fca7d82fe33449bbe55ea"
 [[package]]
 name = "helium-iceberg"
 version = "0.1.0"
-source = "git+https://github.com/helium/oracles?branch=main#de099271df07a7b06bb90665f2edbce362b8faf7"
+source = "git+https://github.com/helium/oracles?branch=main#27042b7a015ba2d8bff53918248021c0a4fccbb4"
 dependencies = [
  "arrow-array",
  "arrow-ipc",
@@ -3739,7 +3739,7 @@ checksum = "f6b464fbc74e149a392436b17d523f769e057cb6877f6a5c4618bc6f11800548"
 [[package]]
 name = "poc-metrics"
 version = "0.1.0"
-source = "git+https://github.com/helium/oracles?branch=main#de099271df07a7b06bb90665f2edbce362b8faf7"
+source = "git+https://github.com/helium/oracles?branch=main#27042b7a015ba2d8bff53918248021c0a4fccbb4"
 dependencies = [
  "futures",
  "metrics",
@@ -5240,7 +5240,7 @@ checksum = "7b2093cf4c8eb1e67749a6762251bc9cd836b6fc171623bd0a9d324d37af2417"
 [[package]]
 name = "task-manager"
 version = "0.1.0"
-source = "git+https://github.com/helium/oracles?branch=main#de099271df07a7b06bb90665f2edbce362b8faf7"
+source = "git+https://github.com/helium/oracles?branch=main#27042b7a015ba2d8bff53918248021c0a4fccbb4"
 dependencies = [
  "futures",
  "futures-util",
@@ -5381,7 +5381,7 @@ checksum = "fd3ca314f692efd6c868f8408f53fe444634a845f96c028b97d35f6a1f79f0ee"
 [[package]]
 name = "tls-init"
 version = "0.1.0"
-source = "git+https://github.com/helium/oracles?branch=main#de099271df07a7b06bb90665f2edbce362b8faf7"
+source = "git+https://github.com/helium/oracles?branch=main#27042b7a015ba2d8bff53918248021c0a4fccbb4"
 dependencies = [
  "ctor",
  "hyper-rustls 0.27.10",
